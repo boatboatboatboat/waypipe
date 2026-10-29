@@ -22,3 +22,10 @@ path = "src/protocol.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "channel"
+path = "src/channel.rs"
+test = false
+doc = false
+bench = false

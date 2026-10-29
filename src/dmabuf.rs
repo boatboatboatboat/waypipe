@@ -1899,6 +1899,7 @@ fn create_cpu_visible_buffer(
     size: usize,
     read_optimized: bool,
 ) -> Result<(vk::Buffer, vk::DeviceMemory, u64), String> {
+    assert!(size > 0);
     let buf_create = vk::BufferCreateInfo::default()
         .size(size as u64)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -2107,8 +2108,15 @@ pub fn vulkan_import_dmabuf(
     drm_format: u32,
     can_store_and_sample: bool,
 ) -> Result<Arc<VulkanDmabuf>, String> {
+    assert!(width > 0 && height > 0);
+
     let vk_format = drm_to_vulkan(drm_format)
         .ok_or_else(|| tag!("Did not find matching Vulkan format for {}", drm_format))?;
+
+    let Some(format_data) = vulk.formats.get(&vk_format) else {
+        return Err(tag!("Unrecognized Vulkan format {:?}", vk_format));
+    };
+
     let format_info = get_vulkan_info(vk_format);
 
     // note: we should still handle planes together, if only because it will be
@@ -2127,18 +2135,26 @@ pub fn vulkan_import_dmabuf(
         .enumerate()
         .all(|(i, x)| planes[*x].plane_idx == i as u32));
 
-    let mod_index = vulk.formats[&vk_format]
+    let mod_index = format_data
         .modifiers
         .iter()
         .position(|x| *x == modifier)
         .unwrap();
-    let mod_data = &vulk.formats[&vk_format].modifier_data[mod_index];
+    let mod_data = &format_data.modifier_data[mod_index];
     let max_size = if can_store_and_sample {
         mod_data.max_size_store_and_sample.unwrap()
     } else {
         mod_data.max_size_transfer
     };
-    assert!(width <= max_size.0 && height <= max_size.1);
+    if width > max_size.0 || height > max_size.1 {
+        return Err(tag!(
+            "Failed to create Vulkan image, size {}x{} exceeds limit {}x{}",
+            width,
+            height,
+            max_size.0,
+            max_size.1
+        ));
+    }
 
     // todo: invert?
     for j in plane_perm.iter() {
@@ -2357,11 +2373,15 @@ pub fn vulkan_create_dmabuf(
     modifier_options: &[u64],
     can_store_and_sample: bool,
 ) -> Result<(Arc<VulkanDmabuf>, Vec<AddDmabufPlane>), String> {
+    assert!(width > 0 && height > 0);
+
     let vk_format = drm_to_vulkan(drm_format)
         .ok_or_else(|| tag!("Did not find matching Vulkan format for {}", drm_format))?;
-    let format_info = get_vulkan_info(vk_format);
 
-    let format_data = &vulk.formats[&vk_format];
+    let Some(format_data) = vulk.formats.get(&vk_format) else {
+        return Err(tag!("Unrecognized Vulkan format {:?}", vk_format));
+    };
+    let format_info = get_vulkan_info(vk_format);
 
     /*<- the list of modifiers that may be chosen */
     let mut mod_options = Vec::new();
@@ -3421,19 +3441,35 @@ impl VulkanDevice {
 }
 
 impl VulkanDmabuf {
+    /** Like [Self::try_nominal_size], but expects size to be valid
+     */
+    pub fn nominal_size(self: &VulkanDmabuf, view_row_length: Option<u32>) -> usize {
+        self.try_nominal_size(view_row_length)
+            .expect("size checked at dmabuf construction")
+    }
+
     /** The total length of the canonical representation of the format
      *
      * If 'view_row_length' is not None, it specifies the row stride to use.
+     *
+     * This also validates `view_row_length`, if set, satisfies divisibility requirements.
      */
-    pub fn nominal_size(self: &VulkanDmabuf, view_row_length: Option<u32>) -> usize {
-        let format_info = get_vulkan_info(self.vk_format);
+    pub fn try_nominal_size(self: &VulkanDmabuf, view_row_length: Option<u32>) -> Option<usize> {
         // TODO: handle multiplanar formats
-        if let Some(r) = view_row_length {
-            (self.height as usize) * (r as usize)
+
+        let format_info = get_vulkan_info(self.vk_format);
+        let packed_stride = (self.width as usize).checked_mul(format_info.bpp as usize)?;
+        let stride = if let Some(r) = view_row_length {
+            if (r as usize) < packed_stride || r % format_info.bpp != 0 {
+                return None;
+            }
+            r as usize
         } else {
-            (self.width as usize) * (self.height as usize) * (format_info.bpp as usize)
-        }
+            packed_stride
+        };
+        (self.height as usize).checked_mul(stride)
     }
+
     /** Get the number of bytes per pixel (assuming DMABUF has a single-plane format) */
     pub fn get_bpp(&self) -> u32 {
         // todo: will need modification for multi-planar support

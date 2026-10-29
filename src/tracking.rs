@@ -3083,6 +3083,13 @@ pub fn process_way_msg(
                 return Err(tag!("Unexpected object extra type"));
             };
 
+            if matches!(glob.dmabuf_device, DmabufDevice::VulkanSetup(_)) {
+                return Err(tag!(
+                    "zwp_linux_dmabuf_feedback_v1::done received before \
+                    Vulkan device setup done; may be missing ::main_device"
+                ));
+            }
+
             let dev_len = write_dev_array(0).len();
 
             if !feedback.processed {
@@ -3101,15 +3108,16 @@ pub fn process_way_msg(
                     )
                     .map_err(|x| tag!("Failed to create memfd: {:?}", x))?;
                     let sz: u32 = new_table.len().try_into().unwrap();
-                    assert!(sz > 0);
 
-                    unistd::ftruncate(&local_fd, sz as libc::off_t)
-                        .map_err(|x| tag!("Failed to resize memfd: {:?}", x))?;
-                    let mapping: ExternalMapping =
-                        ExternalMapping::new(&local_fd, sz as usize, false).map_err(|x| {
-                            tag!("Failed to mmap fd when building new format table: {}", x)
-                        })?;
-                    copy_onto_mapping(&new_table[..], &mapping, 0);
+                    if sz > 0 {
+                        unistd::ftruncate(&local_fd, sz as libc::off_t)
+                            .map_err(|x| tag!("Failed to resize memfd: {:?}", x))?;
+                        let mapping: ExternalMapping =
+                            ExternalMapping::new(&local_fd, sz as usize, false).map_err(|x| {
+                                tag!("Failed to mmap fd when building new format table: {}", x)
+                            })?;
+                        copy_onto_mapping(&new_table[..], &mapping, 0);
+                    }
 
                     let sfd = translate_shm_fd(
                         local_fd,

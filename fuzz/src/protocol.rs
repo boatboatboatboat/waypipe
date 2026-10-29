@@ -254,11 +254,12 @@ fn interact(
                     let (_obj_id, length, _opcode) = parse_header(tail);
                     /* Waypipe should only ever write valid messages */
                     assert!(length >= 8 && length % 4 == 0);
-                    if tail.len() >= length {
-                        let (msg, nxt) = tail.split_at(length);
-                        recv.rmsgs.push(msg.into());
-                        tail = nxt;
-                    }
+                    if tail.len() < length {
+                        break;
+                    };
+                    let (msg, nxt) = tail.split_at(length);
+                    recv.rmsgs.push(msg.into());
+                    tail = nxt;
                 }
                 recv.data.drain(..(recv.data.len() - tail.len()));
             } else if evt.intersects(poll::PollFlags::POLLHUP | poll::PollFlags::POLLERR) {
@@ -278,7 +279,7 @@ fn interact(
                 })];
                 let sfds =
                     &raw_fds[nfds_sent..std::cmp::min(fds.len(), nfds_sent + MAX_FDS_PER_BYTE)];
-                let short_transfer = fds.len() > nfds_sent + MAX_FDS_PER_BYTE;
+                let short_transfer = !sfds.is_empty() || fds.len() > nfds_sent + MAX_FDS_PER_BYTE;
                 let iovs: &[IoSlice] = if short_transfer {
                     &iovs_short
                 } else {
@@ -612,7 +613,6 @@ fuzz_target!(|data: &[u8]| {
         title_prefix: "prefix-".to_string(),
         no_gpu: true,
         drm_node: None,
-        debug_store_video: None,
         test_skip_vulkan: false,
         test_no_timeline_export: false,
         test_no_binary_semaphore_import: false,

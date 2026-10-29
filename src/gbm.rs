@@ -586,14 +586,24 @@ impl GBMDmabuf {
         Ok(())
     }
 
-    // TODO: deduplicate with Vulkan
     pub fn nominal_size(&self, view_row_length: Option<u32>) -> usize {
-        if let Some(r) = view_row_length {
-            (self.height * r) as usize
+        self.try_nominal_size(view_row_length)
+            .expect("size checked at dmabuf construction")
+    }
+
+    // TODO: deduplicate with Vulkan
+    pub fn try_nominal_size(&self, view_row_length: Option<u32>) -> Option<usize> {
+        let bpp = get_bpp_if_rgb_planar(self.format).unwrap();
+        let packed_stride = (self.width as usize).checked_mul(bpp as usize)?;
+        let stride = if let Some(r) = view_row_length {
+            if (r as usize) < packed_stride {
+                return None;
+            }
+            r as usize
         } else {
-            let bpp = get_bpp_if_rgb_planar(self.format).unwrap();
-            (self.width * self.height * bpp) as usize
-        }
+            packed_stride
+        };
+        (self.height as usize).checked_mul(stride)
     }
 
     pub fn get_bpp(&self) -> u32 {

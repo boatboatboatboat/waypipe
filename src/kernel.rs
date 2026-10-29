@@ -654,6 +654,7 @@ pub fn copy_tail_if_diff(
 
 pub fn copy_from_mapping(dest: &mut [u8], fd: &ExternalMapping, start: usize) {
     let byte_level = &fd.get_u8();
+    assert!(start <= byte_level.len() && byte_level.len() - start >= dest.len());
     for i in 0..dest.len() {
         dest[i] = byte_level[i + start].load(Ordering::Relaxed);
     }
@@ -661,6 +662,7 @@ pub fn copy_from_mapping(dest: &mut [u8], fd: &ExternalMapping, start: usize) {
 
 pub fn copy_onto_mapping(src: &[u8], fd: &ExternalMapping, start: usize) {
     let byte_level = &fd.get_u8();
+    assert!(start <= byte_level.len() && byte_level.len() - start >= src.len());
     for i in 0..src.len() {
         byte_level[i + start].store(src[i], Ordering::Relaxed);
     }
@@ -771,12 +773,15 @@ pub fn compute_diff_span(
     let mut diff_main = &diff[..diff.len() - ntrailing];
     assert!(diff_main.len() % 4 == 0);
 
+    if buf_len < ntrailing {
+        return Err("Trailing interval invalid (too long)");
+    }
+
     let nblocks = diff_main.len() / 4;
     if nblocks == 0 {
         if ntrailing == 0 {
             return Err("computed diff span on empty diff");
         } else {
-            assert!(buf_len >= ntrailing);
             return Ok((buf_len - ntrailing, buf_len));
         }
     }
@@ -821,7 +826,7 @@ fn test_buffer_replication() {
 
     let mapping: ExternalMapping = ExternalMapping::new(&local_fd, size, false).unwrap();
 
-    let mut reference_arr = AlignedArray::new(size);
+    let mut reference_arr = AlignedArray::new(size).unwrap();
     let reference = reference_arr.get_mut();
     /* keeping the mapping as all-zero, modify the reference. The exact
      * values aren't so important here */
@@ -845,9 +850,9 @@ fn test_memory_replication() {
 
     fn test_pattern(name: &str, diff_start_pos: usize, fill: &dyn Fn(&mut [u8])) -> u32 {
         let size = 4096;
-        let mut mem_arr = AlignedArray::new(size);
-        let mut reference_arr = AlignedArray::new(size);
-        let mut copy_arr = AlignedArray::new(size);
+        let mut mem_arr = AlignedArray::new(size).unwrap();
+        let mut reference_arr = AlignedArray::new(size).unwrap();
+        let mut copy_arr = AlignedArray::new(size).unwrap();
         let mem = mem_arr.get_mut();
         let reference = reference_arr.get_mut();
         let copy = copy_arr.get_mut();

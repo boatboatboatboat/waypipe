@@ -303,20 +303,25 @@ unsafe impl Send for AlignedArray {}
 unsafe impl Sync for AlignedArray {}
 
 impl AlignedArray {
-    pub fn new(size: usize) -> AlignedArray {
+    pub fn new(size: usize) -> Option<AlignedArray> {
         if size == 0 {
-            AlignedArray {
+            Some(AlignedArray {
                 data: std::ptr::null_mut(),
                 size: 0,
-            }
+            })
         } else {
             let layout = std::alloc::Layout::from_size_align(size, 64).unwrap();
 
             unsafe {
                 // SAFETY: layout size was checked to be > 0
                 let mem = std::alloc::alloc_zeroed(layout).cast::<u8>();
-                assert!(!mem.is_null());
-                AlignedArray { data: mem, size }
+                /* This is one of the largest allocations Waypipe makes and
+                 * is likely to fail if memory is limited. */
+                if mem.is_null() {
+                    None
+                } else {
+                    Some(AlignedArray { data: mem, size })
+                }
             }
         }
     }

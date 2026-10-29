@@ -197,7 +197,10 @@ mod dmabuf_stub {
     }
 
     impl VulkanDmabuf {
-        pub fn nominal_size(self: &VulkanDmabuf, view_row_length: Option<u32>) -> usize {
+        pub fn nominal_size(&self, view_row_length: Option<u32>) -> usize {
+            unreachable!();
+        }
+        pub fn try_nominal_size(&self, view_row_length: Option<u32>) -> Option<usize> {
             unreachable!();
         }
         pub fn get_bpp(&self) -> u32 {
@@ -289,6 +292,9 @@ mod gbm_stub {
             unreachable!();
         }
         pub fn nominal_size(&self, view_row_length: Option<u32>) -> usize {
+            unreachable!();
+        }
+        pub fn try_nominal_size(&self, view_row_length: Option<u32>) -> Option<usize> {
             unreachable!();
         }
         pub fn get_bpp(&self) -> u32 {

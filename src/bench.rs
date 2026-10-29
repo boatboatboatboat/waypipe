@@ -184,9 +184,9 @@ fn read_once(src: &[u8]) -> u32 {
 fn estimate_diff_speed(pattern: DiffPattern) {
     let length: usize = 1 << 20;
 
-    let mut reference_arr = AlignedArray::new(length);
-    let mut source_arr = AlignedArray::new(length);
-    let mut baseline_arr = AlignedArray::new(length);
+    let mut reference_arr = AlignedArray::new(length).unwrap();
+    let mut source_arr = AlignedArray::new(length).unwrap();
+    let mut baseline_arr = AlignedArray::new(length).unwrap();
     let baseline = baseline_arr.get_mut();
     let reference = reference_arr.get_mut();
     let source = source_arr.get_mut();
@@ -282,11 +282,11 @@ fn estimate_diff_compress_speed(
     assert!(length % 64 == 0);
     let nshards = std::cmp::max(3, (length / 64) / (1 << 12));
 
-    let mut src_arr = AlignedArray::new(length);
-    let mut src_mirror_arr = AlignedArray::new(length);
-    let mut diff_arr = AlignedArray::new(length + 8 * nshards);
-    let mut dst_arr = AlignedArray::new(length);
-    let mut dst_mirror_arr = AlignedArray::new(length);
+    let mut src_arr = AlignedArray::new(length).unwrap();
+    let mut src_mirror_arr = AlignedArray::new(length).unwrap();
+    let mut diff_arr = AlignedArray::new(length + 8 * nshards).unwrap();
+    let mut dst_arr = AlignedArray::new(length).unwrap();
+    let mut dst_mirror_arr = AlignedArray::new(length).unwrap();
 
     let src = src_arr.get_mut();
     let src_mirror = src_mirror_arr.get_mut();

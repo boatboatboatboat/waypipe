@@ -1850,7 +1850,13 @@ pub fn start_dmavid_decode_sw(
 
         let frame_width = u32::try_from((*frame).width).unwrap();
         let frame_height = u32::try_from((*frame).height).unwrap();
-        assert!(frame_width % 2 == 0 && frame_height % 2 == 0);
+        if frame_width % 2 != 0 || frame_height % 2 != 0 {
+            return Err(tag!(
+                "Decoded frame size {}x{} as not a multiple of 2x2",
+                frame_width,
+                frame_height
+            ));
+        }
 
         if frame_width < 8 * state.target.width.div_ceil(8)
             || frame_height < 8 * state.target.height.div_ceil(8)

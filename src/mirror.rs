@@ -195,7 +195,10 @@ impl Mirror {
             }
         } else {
             MirrorState {
-                data: MirrorBacking::Alloc(AlignedArray::new(size)),
+                data: MirrorBacking::Alloc(
+                    AlignedArray::new(size)
+                        .ok_or_else(|| tag!("Failed to allocate mirror region of size {}", size))?,
+                ),
                 region_size: size,
                 ranges: BTreeSet::new(),
             }
@@ -307,7 +310,8 @@ impl Mirror {
             }
 
             MirrorBacking::Alloc(ref mut v) => {
-                let mut new = AlignedArray::new(new_size);
+                let mut new = AlignedArray::new(new_size)
+                    .ok_or_else(|| tag!("Failed to allocate mirror region of size {}", new_size))?;
                 new.get_mut()[..v.get().len()].copy_from_slice(v.get());
                 *v = new;
             }

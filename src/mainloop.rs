@@ -1040,7 +1040,7 @@ pub fn try_setup_dmabuf_instance_full(
 /** Fully initialize Vulkan device, and error if this does not work */
 pub fn complete_dmabuf_setup(
     opts: &Options,
-    device: Option<u64>,
+    device_id: Option<u64>,
     dmabuf_dev: &mut DmabufDevice,
 ) -> Result<(), String> {
     if matches!(dmabuf_dev, DmabufDevice::VulkanSetup(_)) {
@@ -1049,12 +1049,15 @@ pub fn complete_dmabuf_setup(
         let DmabufDevice::VulkanSetup(instance) = tmp else {
             unreachable!();
         };
-        let device = setup_vulkan_device(&instance, device, &opts.video, opts.debug)?
-            .expect("Vulkan device existence should already have been checked");
+        let Some(device) = setup_vulkan_device(&instance, device_id, &opts.video, opts.debug)?
+        else {
+            return Err(tag!("No usable Vulkan device with id {:?}", device_id));
+        };
         *dmabuf_dev = DmabufDevice::Vulkan((instance, device));
     }
     Ok(())
 }
+
 pub fn dmabuf_dev_supports_format(dmabuf_dev: &DmabufDevice, format: u32, modifier: u64) -> bool {
     match dmabuf_dev {
         DmabufDevice::Unknown | DmabufDevice::Unavailable | DmabufDevice::VulkanSetup(_) => {
@@ -1191,6 +1194,17 @@ pub fn translate_dmabuf_fd(
     debug!("Translating dmabuf fd");
 
     let drm_modifier = planes[0].modifier;
+    for (i, x) in planes.iter().enumerate() {
+        if x.modifier != drm_modifier {
+            return Err(tag!(
+                "Cannot import dmabuf, plane {} has different modifier 0x{:016x} != 0x{:016x} ",
+                i,
+                x.modifier,
+                drm_modifier
+            ));
+        }
+    }
+
     let (buf, video_encode) = match device {
         DmabufDevice::Unknown | DmabufDevice::Unavailable | DmabufDevice::VulkanSetup(_) => {
             unreachable!()
@@ -1401,6 +1415,9 @@ fn process_sfd_msg(
              * optimizations. Alternative: make an OpenFileV2 message to encode this. */
 
             // todo: handle error
+            if msg.len() != 12 {
+                return Err(tag!("Bad message length for OpenFile"));
+            }
             let size = i32::from_le_bytes(msg[8..12].try_into().unwrap());
 
             if remote_id.0.signum() != -glob.max_local_id.signum() {
@@ -1455,6 +1472,9 @@ fn process_sfd_msg(
             Ok(())
         }
         WmsgType::ExtendFile => {
+            if msg.len() != 12 {
+                return Err(tag!("Bad message length for ExtendFile"));
+            }
             let size = i32::from_le_bytes(msg[8..12].try_into().unwrap());
             let new_size: usize = size
                 .try_into()
@@ -1492,6 +1512,26 @@ fn process_sfd_msg(
         WmsgType::BufferDiff => {
             let sfd_handle = get_sfd(&glob.map, remote_id).ok_or("RID not in map")?;
             let mut sfd = sfd_handle.borrow_mut();
+
+            if msg.len() < 16 {
+                return Err(tag!(
+                    "BufferDiff message only {} bytes, too short",
+                    msg.len()
+                ));
+            }
+            let diff_size = u32::from_le_bytes(msg[8..12].try_into().unwrap());
+            let ntrailing = u32::from_le_bytes(msg[12..16].try_into().unwrap());
+
+            let Some(decomp_len) = diff_size.checked_add(ntrailing) else {
+                return Err(tag!(
+                    "Total diff len must be <2^32, have diff {} + trailing {}",
+                    diff_size,
+                    ntrailing
+                ));
+            };
+            if decomp_len == 0 {
+                return Err(tag!("Diff messages must be nonempty"));
+            }
 
             match &mut sfd.data {
                 ShadowFdVariant::Dmabuf(data) => {
@@ -1566,6 +1606,22 @@ fn process_sfd_msg(
             let sfd_handle = get_sfd(&glob.map, remote_id).ok_or("RID not in map")?;
             let mut sfd = sfd_handle.borrow_mut();
 
+            if msg.len() < 16 {
+                return Err(tag!(
+                    "BufferFill message only {} bytes, too short",
+                    msg.len()
+                ));
+            }
+            let region_start = u32::from_le_bytes(msg[8..12].try_into().unwrap()) as usize;
+            let region_end = u32::from_le_bytes(msg[12..16].try_into().unwrap()) as usize;
+            if region_end <= region_start {
+                return Err(tag!(
+                    "Invalid region for BufferFill: {} {}",
+                    region_start,
+                    region_end
+                ));
+            }
+
             match &mut sfd.data {
                 ShadowFdVariant::Dmabuf(data) => {
                     match data.buf {
@@ -1632,16 +1688,22 @@ fn process_sfd_msg(
 
         WmsgType::OpenDMABUF => {
             // todo: handle error
+
+            if msg.len() != 76 {
+                return Err(tag!("Bad message length for OpenDMABUF"));
+            }
             let width = u32::from_le_bytes(msg[12..16].try_into().unwrap());
             let height = u32::from_le_bytes(msg[16..20].try_into().unwrap());
+            if width == 0 || height == 0 {
+                return Err(tag!("Width and height for OpenDMABUF must be nonzero"));
+            }
+
             let drm_format = u32::from_le_bytes(msg[20..24].try_into().unwrap());
             /* Ignore all other parameters -- these should be chosen locally */
 
             /* For compatibility reasons, will interpret dmabuf data diff/fill ops as having
              * linear layout with the specified stride */
-            let view_row_stride = Some(dmabuf_slice_get_first_stride(
-                msg[12..76].try_into().unwrap(),
-            ));
+            let view_row_stride = dmabuf_slice_get_first_stride(msg[12..76].try_into().unwrap());
 
             if remote_id.0.signum() != -glob.max_local_id.signum() {
                 return Err(tag!(
@@ -1653,6 +1715,15 @@ fn process_sfd_msg(
             let entry = glob.map.entry(remote_id);
             if matches!(entry, btree_map::Entry::Occupied(_)) {
                 return Err(tag!("ShadowFd with RID={} already exists", remote_id));
+            }
+
+            if !matches!(
+                &glob.dmabuf_device,
+                DmabufDevice::Vulkan(_) | DmabufDevice::Gbm(_)
+            ) {
+                return Err(tag!(
+                    "Cannot create DMABUF before device initialized by protocol"
+                ));
             }
 
             /* Restrict to compositor preferred modifiers, if any are available, or the (probably)
@@ -1684,14 +1755,25 @@ fn process_sfd_msg(
                         false,
                     )?;
 
-                    let nom_size = buf.nominal_size(view_row_stride);
+                    let Some(nom_size) = buf.try_nominal_size(Some(view_row_stride)) else {
+                        return Err(tag!(
+                            "Failed to create dmabuf ShadowFd; view stride {} would overflow nominal size or is invalid",
+                            view_row_stride
+                        ));
+                    };
                     (DmabufImpl::Vulkan(buf), nom_size, add_planes)
                 }
                 DmabufDevice::Gbm(ref gbm) => {
                     let mods = gbm_supported_modifiers(gbm, drm_format);
                     let (buf, add_planes) =
                         gbm_create_dmabuf(gbm, width, height, drm_format, mods)?;
-                    let nom_size = buf.nominal_size(view_row_stride);
+
+                    let Some(nom_size) = buf.try_nominal_size(Some(view_row_stride)) else {
+                        return Err(tag!(
+                            "Failed to create dmabuf ShadowFd; view stride {} would overflow nominal size or is invalid",
+                            view_row_stride
+                        ));
+                    };
                     (DmabufImpl::Gbm(buf), nom_size, add_planes)
                 }
             };
@@ -1711,7 +1793,7 @@ fn process_sfd_msg(
                     mirror,
                     drm_format,
                     drm_modifier,
-                    view_row_stride,
+                    view_row_stride: Some(view_row_stride),
                     first_damage: true,
                     damage: Damage::Intervals(Vec::new()),
                     export_planes: add_planes,
@@ -1733,19 +1815,25 @@ fn process_sfd_msg(
 
         WmsgType::OpenDMAVidDstV2 => {
             // 8..12: file size, can ignore
+
+            if msg.len() != 80 {
+                return Err(tag!("Bad message length {} for OpenDMAVidDstV2", msg.len()));
+            }
             let vid_flags = u32::from_le_bytes(msg[12..16].try_into().unwrap());
 
             let width = u32::from_le_bytes(msg[16..20].try_into().unwrap());
             let height = u32::from_le_bytes(msg[20..24].try_into().unwrap());
+            if width == 0 || height == 0 {
+                return Err(tag!("Width and height for OpenDMAVidDstV2 must be nonzero"));
+            }
+
             let drm_format = u32::from_le_bytes(msg[24..28].try_into().unwrap());
             /* Ignore all other parameters -- these should be chosen locally */
 
             /* For compatibility reasons, will interpret dmabuf data diff/fill ops as having
              * linear layout with the specified stride */
             // TODO: need method to prevent diff/fill ops from conflicting with video: is this even needed?
-            let view_row_stride = Some(dmabuf_slice_get_first_stride(
-                msg[12..76].try_into().unwrap(),
-            ));
+            let view_row_stride = dmabuf_slice_get_first_stride(msg[16..80].try_into().unwrap());
 
             if remote_id.0.signum() != -glob.max_local_id.signum() {
                 return Err(tag!(
@@ -1802,6 +1890,12 @@ fn process_sfd_msg(
                 // &[0],
                 true,
             )?;
+            if buf.try_nominal_size(Some(view_row_stride)).is_none() {
+                return Err(tag!(
+                    "Failed to create dmabuf ShadowFd; view stride {} would overflow nominal size or is invalid", view_row_stride
+                ));
+            }
+
             let drm_modifier = add_planes[0].modifier;
 
             let video_decode_state = setup_video_decode(&buf, vid_type)?;
@@ -1814,7 +1908,7 @@ fn process_sfd_msg(
                     mirror: None,
                     drm_format,
                     drm_modifier,
-                    view_row_stride,
+                    view_row_stride: Some(view_row_stride),
                     first_damage: true,
                     damage: Damage::Intervals(Vec::new()),
                     export_planes: add_planes,
@@ -1911,6 +2005,9 @@ fn process_sfd_msg(
             Ok(())
         }
         WmsgType::SignalTimeline => {
+            if msg.len() != 16 {
+                return Err(tag!("Bad message length for SignalTimeline"));
+            }
             let sfd_handle = get_sfd(&glob.map, remote_id).ok_or("RID not in map")?;
             let mut sfd = sfd_handle.borrow_mut();
             let ShadowFdVariant::Timeline(ref mut data) = sfd.data else {
@@ -2062,7 +2159,7 @@ fn process_sfd_msg(
             Ok(())
         }
 
-        _ => unreachable!("Unhandled message type: {:?}", typ),
+        _ => return Err(tag!("Unhandled message type: {:?}", typ)),
     }
 }
 
@@ -2468,7 +2565,12 @@ fn collect_updates(
                 let copied = if let DmabufImpl::Gbm(ref mut gbm_buf) = data.buf {
                     /* Copy out entire contents of buffer immediately and synchronously, to avoid
                      * running into possible threading issues with libgbm. */
-                    let mut v = AlignedArray::new(nominal_size);
+                    let Some(mut v) = AlignedArray::new(nominal_size) else {
+                        return Err(tag!(
+                            "Failed to allocate temporary buffer of size {}",
+                            nominal_size
+                        ));
+                    };
                     gbm_buf.copy_from_dmabuf(
                         data.view_row_stride,
                         v.get_mut(),
@@ -2552,7 +2654,12 @@ fn collect_updates(
                         trailing.1 = trailing.1.min(nominal_size);
                     }
                     let copy_size = damage.iter().map(|intv| intv.1 - intv.0).sum();
-                    let mut v = AlignedArray::new(copy_size);
+                    let Some(mut v) = AlignedArray::new(copy_size) else {
+                        return Err(tag!(
+                            "Failed to allocate temporary buffer of size {}",
+                            copy_size
+                        ));
+                    };
                     gbm_buf.copy_from_dmabuf(data.view_row_stride, v.get_mut(), &damage[..])?;
                     Some(Arc::new(v))
                 } else {
@@ -3253,7 +3360,16 @@ fn decomp_into_slice(
     dst: &mut [u8],
 ) -> Result<(), String> {
     match comp {
-        Compression::None => dst.copy_from_slice(src),
+        Compression::None => {
+            if src.len() != dst.len() {
+                return Err(tag!(
+                    "Uncompressed data length {} does not match expected length {}",
+                    src.len(),
+                    dst.len()
+                ));
+            }
+            dst.copy_from_slice(src)
+        }
         Compression::Lz4(_) => {
             lz4_decompress_to_slice(src, dst).ok_or_else(|| tag!("Failed to decompress"))?
         }
@@ -3274,7 +3390,13 @@ fn decomp_into_vec(
 ) -> Result<Vec<u8>, String> {
     Ok(match comp {
         Compression::None => {
-            assert!(src.len() == uncomp_len);
+            if src.len() != uncomp_len {
+                return Err(tag!(
+                    "Uncompressed data length {} does not match expected length {}",
+                    src.len(),
+                    uncomp_len
+                ));
+            }
             Vec::from(src)
         }
         Compression::Lz4(_) => {
@@ -3318,18 +3440,25 @@ fn run_decomp_task(task: &DecompTask, cache: &mut ThreadCache) -> Result<DecompR
 
     let header = u32::from_le_bytes(msg[0..4].try_into().unwrap());
     let (len, t) = parse_wmsg_header(header).unwrap();
+    let msg = &msg[..len];
     let remote_id = Rid(i32::from_le_bytes(msg[4..8].try_into().unwrap()));
     if t == WmsgType::BufferDiff {
+        /* These basic properties were checked in main thread */
+        assert!(msg.len() >= 16);
         let diff_size = u32::from_le_bytes(msg[8..12].try_into().unwrap());
         let ntrailing = u32::from_le_bytes(msg[12..16].try_into().unwrap());
+        let decomp_len = diff_size.checked_add(ntrailing).unwrap();
+        assert!(decomp_len > 0);
 
         match &task.target {
             DecompTarget::Dmabuf(target) => {
-                let decomp_len = (diff_size + ntrailing) as usize;
-
                 // Note: this is 'read-optimized', since the diff span and segment calculation
                 // depend on the buffer contents. TODO: any better solution?
-                let write_buf = Arc::new(vulkan_get_buffer(&target.dst.vulk, decomp_len, true)?);
+                let write_buf = Arc::new(vulkan_get_buffer(
+                    &target.dst.vulk,
+                    decomp_len as usize,
+                    true,
+                )?);
                 let write_view = write_buf.get_write_view();
                 decomp_into_slice(
                     task.compression,
@@ -3436,7 +3565,7 @@ fn run_decomp_task(task: &DecompTask, cache: &mut ThreadCache) -> Result<DecompR
                         task.compression,
                         &mut cache.comp,
                         &msg[16..len],
-                        decomp_len,
+                        decomp_len as usize,
                     )?;
                     let b = target.dst.get_bpp() as usize;
                     let (ext_start, ext_end) = (b * (region_start / b), align(region_end, b));
@@ -3463,7 +3592,7 @@ fn run_decomp_task(task: &DecompTask, cache: &mut ThreadCache) -> Result<DecompR
                     task.compression,
                     &mut cache.comp,
                     &msg[16..len],
-                    (diff_size + ntrailing) as usize,
+                    decomp_len as usize,
                 )?;
 
                 /* Compute region from diff */
@@ -3504,7 +3633,7 @@ fn run_decomp_task(task: &DecompTask, cache: &mut ThreadCache) -> Result<DecompR
                     task.compression,
                     &mut cache.comp,
                     &msg[16..len],
-                    (diff_size + ntrailing) as usize,
+                    decomp_len as usize,
                 )?;
 
                 /* Compute region from diff */
@@ -3532,12 +3661,12 @@ fn run_decomp_task(task: &DecompTask, cache: &mut ThreadCache) -> Result<DecompR
             }
         }
     } else if t == WmsgType::BufferFill {
+        /* These properties were checked in main thread */
+        assert!(msg.len() >= 16);
         let region_start = u32::from_le_bytes(msg[8..12].try_into().unwrap()) as usize;
         let region_end = u32::from_le_bytes(msg[12..16].try_into().unwrap()) as usize;
-        if region_end <= region_start {
-            return Err(tag!("Invalid region: {} {}", region_start, region_end));
-        }
-        let reg_len = region_end - region_start;
+        let reg_len = region_end.checked_sub(region_start).unwrap();
+        assert!(reg_len > 0);
 
         match &task.target {
             DecompTarget::Dmabuf(target) => {
@@ -3632,6 +3761,21 @@ fn run_decomp_task(task: &DecompTask, cache: &mut ThreadCache) -> Result<DecompR
                 }
             }
             DecompTarget::File(target) => {
+                if region_end > target.target.mapping.get_u8().len() {
+                    return Err(tag!(
+                        "Fill region too long, end {} > {}",
+                        region_end,
+                        target.target.mapping.get_u8().len()
+                    ));
+                }
+                if !target.skip_mirror && region_end > target.target.mem_mirror.len() {
+                    return Err(tag!(
+                        "Fill region too long, end {} > {}",
+                        region_end,
+                        target.target.mem_mirror.len()
+                    ));
+                }
+
                 let fill =
                     decomp_into_vec(task.compression, &mut cache.comp, &msg[16..len], reg_len)?;
                 Ok(DecompReturn::Shm(ApplyTask {
@@ -3651,6 +3795,15 @@ fn run_decomp_task(task: &DecompTask, cache: &mut ThreadCache) -> Result<DecompR
             DecompTarget::MirrorOnly(target) => {
                 let fill =
                     decomp_into_vec(task.compression, &mut cache.comp, &msg[16..len], reg_len)?;
+
+                if region_end > target.mirror.len() {
+                    return Err(tag!(
+                        "Fill region too long, end {} > {}",
+                        region_end,
+                        target.mirror.len()
+                    ));
+                }
+
                 Ok(DecompReturn::Shm(ApplyTask {
                     sequence: task.sequence.unwrap(),
                     data: fill,
@@ -3937,7 +4090,13 @@ fn process_channel(
 
         match typ {
             WmsgType::Version => {
-                let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+                if msg.len() != 8 {
+                    return Err(tag!(
+                        "Version tag length should be exactly 8, not {}",
+                        msg.len()
+                    ));
+                }
+                let version = u32::from_le_bytes(msg[4..8].try_into().unwrap());
                 if version > WAYPIPE_PROTOCOL_VERSION {
                     return Err(tag!(
                         "waypipe client replied with larger protocol version ({}) than requested ({})", version, WAYPIPE_PROTOCOL_VERSION

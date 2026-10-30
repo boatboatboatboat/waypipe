@@ -1295,6 +1295,57 @@ pub fn setup_video_decode(
     }
 }
 
+/** Whether buffers of this DRM format may be sent as video */
+fn is_video_drm_format(drm_format: u32) -> bool {
+    let Ok(wlfmt) = TryInto::<WlShmFormat>::try_into(drm_to_wayland(drm_format)) else {
+        return false;
+    };
+    matches!(
+        wlfmt,
+        WlShmFormat::Rgb565
+            | WlShmFormat::Bgr565
+            | WlShmFormat::Xrgb8888
+            | WlShmFormat::Xbgr8888
+            // These exceed the bit depth of the video formats, but video is already lossy.
+            // 10-bit encoding is still probably worth using if fast
+            | WlShmFormat::Xrgb2101010
+            | WlShmFormat::Xbgr2101010
+            | WlShmFormat::Xrgb16161616
+            | WlShmFormat::Xbgr16161616
+    )
+}
+
+/** Whether a video stream for a buffer of this format and size can be decoded here, by the
+ * decoder setup_video_decode() picks for it; unlike sending, receiving needs no encoder */
+pub fn supports_video_decode(
+    vulk: &VulkanDevice,
+    fmt: VideoFormat,
+    drm_format: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    let Some(ref vid) = vulk.video else {
+        return false;
+    };
+    if !is_video_drm_format(drm_format) {
+        return false;
+    }
+    match fmt {
+        VideoFormat::H264 => {
+            let hw_dec = vid.can_hw_dec_h264
+                && !vid.codecs_h264.decoder.is_null()
+                && width >= MIN_H264_HW_SIZE.0
+                && height >= MIN_H264_HW_SIZE.1;
+            hw_dec || !vid.codecs_h264.sw_decoder.is_null()
+        }
+        VideoFormat::VP9 => !vid.codecs_vp9.sw_decoder.is_null(),
+        VideoFormat::AV1 => {
+            let hw_dec = vid.can_hw_dec_av1 && !vid.codecs_av1.decoder.is_null();
+            hw_dec || !vid.codecs_av1.sw_decoder.is_null()
+        }
+    }
+}
+
 pub fn supports_video_format(
     vulk: &VulkanDevice,
     fmt: VideoFormat,
@@ -1305,46 +1356,29 @@ pub fn supports_video_format(
     let Some(ref vid) = vulk.video else {
         return false;
     };
-    let Ok(wlfmt) = TryInto::<WlShmFormat>::try_into(drm_to_wayland(drm_format)) else {
+    if !is_video_drm_format(drm_format) {
         return false;
-    };
-    match wlfmt {
-        WlShmFormat::Rgb565 => (),
-        WlShmFormat::Bgr565 => (),
-        WlShmFormat::Xrgb8888 => (),
-        WlShmFormat::Xbgr8888 => (),
-        // These exceed the bit depth of the video formats, but video is already lossy.
-        // 10-bit encoding is still probably worth using if fast
-        WlShmFormat::Xrgb2101010 => (),
-        WlShmFormat::Xbgr2101010 => (),
-        WlShmFormat::Xrgb16161616 => (),
-        WlShmFormat::Xbgr16161616 => (),
-        _ => {
-            return false;
-        }
-    };
+    }
 
     // TODO: lookup max size available for format
-    /* A hardware encoder serves a buffer setup_video_encode() sends to it, so a buffer of at
-     * least its minimum size needs no software encoder */
+    /* Only the encoder matters here; the receiving end checks its decoder with
+     * supports_video_decode(). A hardware encoder serves a buffer setup_video_encode() sends to
+     * it, so a buffer of at least its minimum size needs no software encoder */
     match fmt {
         VideoFormat::H264 => {
             let hw_enc = vid.can_hw_enc_h264
                 && !vid.codecs_h264.encoder.is_null()
                 && width >= MIN_H264_HW_SIZE.0
                 && height >= MIN_H264_HW_SIZE.1;
-            !vid.codecs_h264.sw_decoder.is_null()
-                && (hw_enc || !vid.codecs_h264.sw_encoder.is_null())
+            hw_enc || !vid.codecs_h264.sw_encoder.is_null()
         }
-        VideoFormat::VP9 => {
-            !vid.codecs_vp9.sw_decoder.is_null() && !vid.codecs_vp9.sw_encoder.is_null()
-        }
+        VideoFormat::VP9 => !vid.codecs_vp9.sw_encoder.is_null(),
         VideoFormat::AV1 => {
             let hw_enc = vid.can_hw_enc_av1
                 && !vid.codecs_av1.encoder.is_null()
                 && width >= MIN_AV1_HW_ENC_SIZE.0
                 && height >= MIN_AV1_HW_ENC_SIZE.1;
-            !vid.codecs_av1.sw_decoder.is_null() && (hw_enc || !vid.codecs_av1.sw_encoder.is_null())
+            hw_enc || !vid.codecs_av1.sw_encoder.is_null()
         }
     }
 }
@@ -3463,7 +3497,10 @@ fn test_video(try_hardware: bool) {
             let mut format_modifiers = Vec::<(u32, u64, bool)>::new();
             'scan: for f in DRM_FORMATS {
                 for s in sizes {
-                    if !supports_video_format(&vulk, video_format, *f, s.0 as u32, s.1 as u32) {
+                    let (w, h) = (s.0 as u32, s.1 as u32);
+                    if !supports_video_format(&vulk, video_format, *f, w, h)
+                        || !supports_video_decode(&vulk, video_format, *f, w, h)
+                    {
                         continue 'scan;
                     }
                 }

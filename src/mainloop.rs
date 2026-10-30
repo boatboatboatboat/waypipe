@@ -1736,9 +1736,9 @@ fn process_sfd_msg(
                     "Received OpenDMAVidDstV2 before Vulkan device was set up"
                 ));
             };
-            if !supports_video_format(vulk, vid_type, drm_format, width, height) {
+            if !supports_video_decode(vulk, vid_type, drm_format, width, height) {
                 return Err(tag!(
-                    "Video format {:?} at {}x{} is not supported",
+                    "Video format {:?} at {}x{} cannot be decoded",
                     vid_type,
                     width,
                     height

@@ -99,12 +99,16 @@ compressible as images containing pictures.
 	For server or ssh mode: answer an application's frame callbacks in the
 	server, at most *F* times a second and once the previous frame has been
 	sent, and release its buffers once their contents are captured, instead of
-	waiting a round trip for the compositor's answers. While a surface's oldest
-	frame callback answered in the server has waited for the compositor's answer
-	100 ms longer than the shortest recent round trip, its next callbacks wait
-	too, until the compositor's answers catch up. A surface whose frame
-	callback the compositor has held for over a second, as it does for a
-	hidden window, is left to the compositor until it answers. An
+	waiting a round trip for the compositor's answers. A _wl_display.sync_ that
+	follows one or more requests, all giving new contents to surfaces already
+	showing a buffer (as EGL sends after each frame), is answered in the server
+	too, once those commits are captured. While a surface's oldest frame
+	callback, or the oldest sync, answered in the server has waited for the
+	compositor's answer 100 ms longer than the shortest recent round trip, that
+	surface's next callbacks, or the next syncs, wait too, until the
+	compositor's answers catch up. A surface
+	whose frame callback the compositor has held for over a second, as it does
+	for a hidden window, is left to the compositor until it answers. An
 	application can draw into a buffer released this way while the local side
 	still shows its previous contents. A buffer with an explicit-sync release
 	point (_wp_linux_drm_syncobj_v1_) gets a _wl_buffer.release_ too, although

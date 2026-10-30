@@ -2326,6 +2326,7 @@ pub fn setup_video_encode_sw(
     img: &Arc<VulkanDmabuf>,
     fmt: VideoFormat,
     bpf: Option<f32>,
+    threads: usize,
 ) -> Result<VideoEncodeState, String> {
     let video = img.vulk.video.as_ref().unwrap();
 
@@ -2372,6 +2373,10 @@ pub fn setup_video_encode_sw(
 
             cr.pix_fmt = AVPixelFormat_AV_PIX_FMT_YUV420P;
             // cr.color_range = AVColorRange_AVCOL_RANGE_MPEG;
+
+            /* libavcodec's default of one thread makes software encoding of large windows far
+             * slower than the encoders can go; use as many as Waypipe's own workers */
+            cr.thread_count = threads.try_into().unwrap();
         }
 
         /* Encoder specific options. In general, minimize latency */
@@ -2389,14 +2394,20 @@ pub fn setup_video_encode_sw(
                     (b"cpu-used\0", b"8\0"),
                 ],
             )?,
-            VideoFormat::AV1 => build_av_dict(
-                &video.bindings,
-                &[
+            VideoFormat::AV1 => {
+                let mut opts: Vec<(&[u8], &[u8])> = vec![
                     (b"usage\0", b"realtime\0"),
                     (b"lag-in-frames\0", b"0\0"),
                     (b"cpu-used\0", b"8\0"),
-                ],
-            )?,
+                    (b"row-mt\0", b"1\0"),
+                ];
+                /* Tiles give the threads work within one frame; libaom refuses 2x2 tiles for a
+                 * frame of 65 pixels or less a side, so they need two 64x64 superblocks a side */
+                if frame_width >= 128 && frame_height >= 128 {
+                    opts.push((b"tiles\0", b"2x2\0"));
+                }
+                build_av_dict(&video.bindings, &opts)?
+            }
         };
 
         avcodec_open(&video.bindings, ctx, sw_encoder, &mut options)?;
@@ -2417,6 +2428,7 @@ pub fn setup_video_encode(
     img: &Arc<VulkanDmabuf>,
     fmt: VideoFormat,
     bpf: Option<f32>,
+    threads: usize,
 ) -> Result<VideoEncodeState, String> {
     assert!(img.can_store_and_sample);
     let video = img.vulk.video.as_ref().unwrap();
@@ -2436,7 +2448,7 @@ pub fn setup_video_encode(
     if can_hw_encode {
         setup_video_encode_hw(img, fmt, bpf)
     } else {
-        setup_video_encode_sw(img, fmt, bpf)
+        setup_video_encode_sw(img, fmt, bpf, threads)
     }
 }
 
@@ -3501,7 +3513,7 @@ fn test_video(try_hardware: bool) {
                     drop(planes);
 
                     let enc_state =
-                        Arc::new(setup_video_encode(&dmabuf1, video_format, None).unwrap());
+                        Arc::new(setup_video_encode(&dmabuf1, video_format, None, 2).unwrap());
                     let dec_state = Arc::new(setup_video_decode(&dmabuf2, video_format).unwrap());
 
                     println!(

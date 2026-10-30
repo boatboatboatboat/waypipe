@@ -338,6 +338,7 @@ mod video_stub {
         img: &Arc<VulkanDmabuf>,
         fmt: VideoFormat,
         bpf: Option<f32>,
+        threads: usize,
     ) -> Result<VideoEncodeState, &'static str> {
         unreachable!();
     }

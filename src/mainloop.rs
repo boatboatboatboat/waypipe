@@ -1223,6 +1223,7 @@ pub fn translate_dmabuf_fd(
                         &buf,
                         f,
                         opts.video.bits_per_frame,
+                        worker_thread_count(opts.threads),
                     )?))
                 } else {
                     None
@@ -5807,11 +5808,7 @@ pub fn main_interface_loop(
         wake_fd: wake_w,
     };
 
-    let nthreads = if opts.threads == 0 {
-        std::cmp::max(1, std::thread::available_parallelism().unwrap().get() / 2)
-    } else {
-        opts.threads as usize
-    };
+    let nthreads = worker_thread_count(opts.threads);
 
     let tasksys_ref: &TaskSystem = &tasksys;
     let ret = std::thread::scope(|scope| {

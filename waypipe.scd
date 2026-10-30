@@ -13,7 +13,7 @@ waypipe - A transparent proxy for Wayland applications
 *waypipe* *bench*++
 *waypipe* [*--version*] [*-h*, *--help*]
 
-\[options...\] = [*-c*, *--compress* C] [*-d*, *--debug*] [*-n*, *--no-gpu*] [*-o*, *--oneshot*] [*-s*, *--socket* S] [*--display* D] [*--drm-node* R] [*--remote-node* R] [*--ssh-bin R*] [*--remote-bin* R] [*--remote-socket* S] [*--login-shell*] [*--threads* T] [*--title-prefix* P] [*--unlink-socket*] [*--video* V] [*--vsock*] [*--secctx S*] [*--xwls*]
+\[options...\] = [*-c*, *--compress* C] [*-d*, *--debug*] [*-n*, *--no-gpu*] [*-o*, *--oneshot*] [*-s*, *--socket* S] [*--display* D] [*--drm-node* R] [*--frame-rate* F] [*--remote-node* R] [*--ssh-bin R*] [*--remote-bin* R] [*--remote-socket* S] [*--login-shell*] [*--threads* T] [*--title-prefix* P] [*--unlink-socket*] [*--video* V] [*--vsock*] [*--secctx S*] [*--xwls*]
 
 
 
@@ -94,6 +94,22 @@ compressible as images containing pictures.
 *--drm-node R*
 	Specify the path *R* to the drm device that this instance of waypipe should
 	use and (in server mode) notify connecting applications about.
+
+*--frame-rate F*
+	For server or ssh mode: answer an application's frame callbacks in the
+	server, at most *F* times a second and once the previous frame has been
+	sent, and release its buffers once their contents are captured, instead of
+	waiting a round trip for the compositor's answers. While a surface's oldest
+	frame callback answered in the server has waited for the compositor's answer
+	100 ms longer than the shortest recent round trip, its next callbacks wait
+	too, until the compositor's answers catch up. A surface whose frame
+	callback the compositor has held for over a second, as it does for a
+	hidden window, is left to the compositor until it answers. An
+	application can draw into a buffer released this way while the local side
+	still shows its previous contents. A buffer with an explicit-sync release
+	point (_wp_linux_drm_syncobj_v1_) gets a _wl_buffer.release_ too, although
+	that protocol leaves its delivery undefined. The default, _0_, waits for the
+	compositor.
 
 *--remote-node R*
 	In ssh mode, specify the path *R* to the drm device that the remote instance

@@ -108,13 +108,15 @@ const ID_SEQUENCE: [ObjId; 12] = [
  * possibly stopping early if the connection is closed.
  *
  * Returns: the messages received on the other end, minus the test message; if there was an error details
- * will be returned */
+ * will be returned. Messages the program receives while it writes are collected in `replies` when
+ * given, and are an error otherwise. */
 fn test_interact(
     prog: &OwnedFd,
     comp: &OwnedFd,
     write_to_prog: bool,
     data: &[u8],
     fds: &[&OwnedFd],
+    replies: Option<&mut Vec<Vec<u8>>>,
 ) -> (Vec<Vec<u8>>, Vec<OwnedFd>, Option<(ObjId, u32, String)>) {
     let mut end_msg = [0_u8; 8];
     let mut end_msg_view: &mut [u8] = &mut end_msg;
@@ -338,7 +340,14 @@ fn test_interact(
 
     if write_to_prog {
         assert!(recv_prog.fds.is_empty());
-        assert!((recv_prog.rmsgs.len() == (err.is_some() as usize)) && recv_prog.data.is_empty());
+        if let Some(r) = replies {
+            if err.is_none() {
+                r.append(&mut recv_prog.rmsgs);
+            }
+        } else {
+            assert!(recv_prog.rmsgs.len() == (err.is_some() as usize));
+        }
+        assert!(recv_prog.data.is_empty());
         (recv_comp.rmsgs, recv_comp.fds, err)
     } else {
         assert!(recv_comp.fds.is_empty());
@@ -628,7 +637,8 @@ impl ProtocolTestContext {
         data: &[u8],
         fds: &[&OwnedFd],
     ) -> Result<(Vec<Vec<u8>>, Vec<OwnedFd>), (ObjId, u32, String)> {
-        let (msg, ofds, err) = test_interact(&self.sock_prog, &self.sock_comp, true, data, fds);
+        let (msg, ofds, err) =
+            test_interact(&self.sock_prog, &self.sock_comp, true, data, fds, None);
         if let Some(e) = err {
             Err(e)
         } else {
@@ -641,7 +651,8 @@ impl ProtocolTestContext {
         data: &[u8],
         fds: &[&OwnedFd],
     ) -> Result<(Vec<Vec<u8>>, Vec<OwnedFd>), (ObjId, u32, String)> {
-        let (msg, ofds, err) = test_interact(&self.sock_prog, &self.sock_comp, false, data, fds);
+        let (msg, ofds, err) =
+            test_interact(&self.sock_prog, &self.sock_comp, false, data, fds, None);
         if let Some(e) = err {
             Err(e)
         } else {
@@ -656,6 +667,62 @@ impl ProtocolTestContext {
     fn comp_write_passthrough(&mut self, data: Vec<u8>) {
         assert!(is_plain_msgs(self.comp_write(&data, &[]), data));
     }
+    /** Write data and fds to the program-side Waypipe instance; return the messages reaching the
+     * compositor, and add those the program receives meanwhile to `replies` */
+    fn prog_write_replies(
+        &mut self,
+        data: &[u8],
+        fds: &[&OwnedFd],
+        replies: &mut Vec<Vec<u8>>,
+    ) -> (Vec<Vec<u8>>, Vec<OwnedFd>) {
+        let (msg, ofds, err) = test_interact(
+            &self.sock_prog,
+            &self.sock_comp,
+            true,
+            data,
+            fds,
+            Some(replies),
+        );
+        assert!(err.is_none(), "{:?}", err);
+        (msg, ofds)
+    }
+    /** Read messages reaching the program into `got` until one of them satisfies `done`;
+     * panic after a second without one */
+    fn prog_wait_for(&mut self, got: &mut Vec<Vec<u8>>, done: &dyn Fn(&[u8]) -> bool) {
+        let start = Instant::now();
+        let mut recv = ReadRecv {
+            data: Vec::new(),
+            fds: Vec::new(),
+            eof: false,
+        };
+        while !got.iter().any(|m| done(m)) {
+            let remaining = Duration::from_secs(1).saturating_sub(start.elapsed());
+            assert!(!remaining.is_zero(), "timeout waiting for a message");
+            let mut pfds = [poll::PollFd::new(
+                self.sock_prog.as_fd(),
+                poll::PollFlags::POLLIN,
+            )];
+            let _ = nix::poll::ppoll(
+                &mut pfds,
+                Some(time::TimeSpec::from_duration(remaining)),
+                None,
+            );
+            if pfds[0]
+                .revents()
+                .is_some_and(|e| e.contains(poll::PollFlags::POLLIN))
+            {
+                assert!(!test_read_from_socket(self.sock_prog.as_fd(), &mut recv));
+                let mut tail: &[u8] = &recv.data;
+                while tail.len() >= 8 && tail.len() >= parse_wl_header(tail).1 {
+                    let (msg, nxt) = tail.split_at(parse_wl_header(tail).1);
+                    got.push(msg.into());
+                    tail = nxt;
+                }
+                recv.data.drain(..(recv.data.len() - tail.len()));
+            }
+        }
+        assert!(recv.data.is_empty() && recv.fds.is_empty());
+    }
 }
 
 /** Options to be passed to an instance of Waypipe */
@@ -666,6 +733,8 @@ struct WaypipeOptions<'a> {
     video: VideoSetting,
     title_prefix: &'a str,
     compression: Compression,
+    /** --frame-rate, for the program-side instance; 0 leaves it out */
+    frame_rate: u32,
 }
 
 /** Construct the command to run a Waypipe connection handling process, with specified options. */
@@ -701,6 +770,9 @@ fn build_arguments(waypipe_bin: &OsStr, opts: &WaypipeOptions, is_client: bool) 
     }
     if let Some(ver) = opts.wire_version {
         v.push(format!("--test-wire-version={}", ver));
+    }
+    if opts.frame_rate > 0 && !is_client {
+        v.push(format!("--frame-rate={}", opts.frame_rate));
     }
 
     if is_client {
@@ -806,6 +878,7 @@ fn run_protocol_test_with_drm_node(
 ) -> Result<(), StatusBad> {
     let options = WaypipeOptions {
         wire_version: None,
+        frame_rate: 0,
         drm_node: Some(device.id),
         device_type: device.device_type,
         compression: Compression::None,
@@ -822,6 +895,7 @@ fn run_protocol_test(
 ) -> Result<(), StatusBad> {
     let options = WaypipeOptions {
         wire_version: None,
+        frame_rate: 0,
         drm_node: None,
         device_type: RenderDeviceType::Vulkan,
         compression: Compression::None,
@@ -1023,6 +1097,7 @@ fn proto_basic(info: TestInfo) -> TestResult {
 fn proto_base_wire(info: TestInfo) -> TestResult {
     let opts = WaypipeOptions {
         wire_version: Some(MIN_PROTOCOL_VERSION),
+        frame_rate: 0,
         drm_node: None,
         device_type: RenderDeviceType::Vulkan,
         title_prefix: "",
@@ -3078,6 +3153,7 @@ fn proto_dmavid(
         drm_node: Some(device.id),
         device_type: device.device_type,
         wire_version: None,
+        frame_rate: 0,
     };
     println!(
         "\nTrying combination: video={:?}, try_hw_dec={}, try_hw_enc={}",
@@ -3127,6 +3203,231 @@ fn proto_dmavid(
     } else {
         Err(StatusBad::Unclear("Video replication not exact".into()))
     }
+}
+
+/** If `msg` is a wl_callback.done, its callback and time */
+fn callback_done(msg: &[u8]) -> Option<(ObjId, u32)> {
+    let (obj, _len, opcode) = parse_wl_header(msg);
+    if msg.len() != length_evt_wl_callback_done() || opcode != OPCODE_WL_CALLBACK_DONE.code() {
+        return None;
+    }
+    Some((obj, parse_evt_wl_callback_done(msg).ok()?))
+}
+
+/** Test that with --frame-rate the program-side instance answers frame callbacks itself; that a
+ * callback the compositor answers first is passed on once, in the instance's clock; that a
+ * released callback id is never answered; and that a surface whose callback the compositor holds
+ * back is left to the compositor */
+fn proto_frame_rate(info: TestInfo) -> TestResult {
+    let opts = WaypipeOptions {
+        wire_version: None,
+        drm_node: None,
+        device_type: RenderDeviceType::Vulkan,
+        video: VideoSetting::default(),
+        title_prefix: "",
+        compression: Compression::None,
+        frame_rate: 1000,
+    };
+    run_protocol_test_with_opts(&info, &opts, &opts, &|mut ctx: ProtocolTestContext| {
+        let (display, registry, shm, comp, surface, pool, buffer, surface2) = (
+            ObjId(1),
+            ObjId(2),
+            ObjId(3),
+            ObjId(4),
+            ObjId(5),
+            ObjId(6),
+            ObjId(7),
+            ObjId(8),
+        );
+        let is_done = |cb: ObjId| move |m: &[u8]| callback_done(m).is_some_and(|(c, _)| c == cb);
+        let dones = |msgs: &[Vec<u8>], cb: ObjId| msgs.iter().filter(|m| is_done(cb)(m)).count();
+
+        ctx.prog_write_passthrough(build_msgs(|dst| {
+            write_req_wl_display_get_registry(dst, display, registry);
+        }));
+        ctx.comp_write_passthrough(build_msgs(|dst| {
+            write_evt_wl_registry_global(dst, registry, 1, WL_SHM, 2);
+            write_evt_wl_registry_global(dst, registry, 2, WL_COMPOSITOR, 6);
+        }));
+        ctx.prog_write_passthrough(build_msgs(|dst| {
+            write_req_wl_registry_bind(dst, registry, 1, WL_SHM, 2, shm);
+            write_req_wl_registry_bind(dst, registry, 2, WL_COMPOSITOR, 6, comp);
+            write_req_wl_compositor_create_surface(dst, comp, surface);
+        }));
+
+        let (w, h) = (16, 16);
+        let buf_fd = make_file_with_contents(&vec![0x80; w * h]).unwrap();
+        let new_frame = |cb: ObjId| {
+            build_msgs(|dst| {
+                write_req_wl_surface_attach(dst, surface, buffer, 0, 0);
+                write_req_wl_surface_damage_buffer(dst, surface, 0, 0, 1, 1);
+                write_req_wl_surface_frame(dst, surface, cb);
+                write_req_wl_surface_commit(dst, surface);
+            })
+        };
+
+        /* A frame callback is answered once its surface commits; the compositor's own answer is
+         * then dropped, and its delete_id passed on */
+        let (cb1, cb2, cb3, cb4, cb5, cb8, cb9) = (
+            ObjId(20),
+            ObjId(21),
+            ObjId(22),
+            ObjId(23),
+            ObjId(24),
+            ObjId(27),
+            ObjId(28),
+        );
+        let mut msgs = build_msgs(|dst| {
+            write_req_wl_shm_create_pool(dst, shm, false, pool, (w * h) as i32);
+            write_req_wl_shm_pool_create_buffer(
+                dst,
+                pool,
+                buffer,
+                0,
+                w as i32,
+                h as i32,
+                w as i32,
+                WlShmFormat::R8 as u32,
+            );
+        });
+        msgs.extend_from_slice(&new_frame(cb1));
+        let mut got = Vec::new();
+        let (rmsg, _rfd) = ctx.prog_write_replies(&msgs, &[&buf_fd], &mut got);
+        assert!(rmsg.concat() == msgs);
+        ctx.prog_wait_for(&mut got, &is_done(cb1));
+        assert!(dones(&got, cb1) == 1);
+        let (rmsg, _) = ctx
+            .comp_write(
+                &build_msgs(|dst| {
+                    write_evt_wl_callback_done(dst, cb1, 777);
+                    write_evt_wl_display_delete_id(dst, display, cb1.0);
+                }),
+                &[],
+            )
+            .unwrap();
+        assert!(
+            rmsg.concat() == build_msgs(|dst| write_evt_wl_display_delete_id(dst, display, cb1.0))
+        );
+
+        /* The compositor answering first: passed on in the instance's clock, not answered again */
+        let mut got = Vec::new();
+        ctx.prog_write_replies(
+            &build_msgs(|dst| write_req_wl_surface_frame(dst, surface, cb2)),
+            &[],
+            &mut got,
+        );
+        let compositor_time = 0xabcd0000;
+        let (rmsg, _) = ctx
+            .comp_write(
+                &build_msgs(|dst| {
+                    write_evt_wl_callback_done(dst, cb2, compositor_time);
+                    write_evt_wl_display_delete_id(dst, display, cb2.0);
+                }),
+                &[],
+            )
+            .unwrap();
+        assert!(rmsg.len() == 2);
+        let (cb, time) = callback_done(&rmsg[0]).unwrap();
+        assert!(cb == cb2 && time != compositor_time && time < 600_000);
+        ctx.prog_write_replies(&new_frame(cb3), &[], &mut got);
+        ctx.prog_wait_for(&mut got, &is_done(cb3));
+        assert!(dones(&got, cb2) == 0);
+
+        /* A callback whose id the compositor released is not answered, even once reused */
+        let mut got = Vec::new();
+        ctx.prog_write_replies(
+            &build_msgs(|dst| write_req_wl_surface_frame(dst, surface, cb4)),
+            &[],
+            &mut got,
+        );
+        ctx.comp_write_passthrough(build_msgs(|dst| {
+            write_evt_wl_display_delete_id(dst, display, cb4.0);
+        }));
+        ctx.prog_write_replies(&new_frame(cb4), &[], &mut got);
+        ctx.prog_wait_for(&mut got, &is_done(cb4));
+        ctx.prog_write_replies(&new_frame(cb5), &[], &mut got);
+        ctx.prog_wait_for(&mut got, &is_done(cb5));
+        assert!(dones(&got, cb4) == 1);
+
+        /* Once the oldest callback answered here has waited for the compositor's answer more
+         * than LOCAL_FRAME_QUEUE past the shortest round trip seen (cb1's, a moment), the
+         * surface's next callback waits for the compositor's answers to catch up, while another
+         * surface's is still answered here */
+        let (cb_a, cb_b, surface3, cb_c) = (ObjId(34), ObjId(35), ObjId(36), ObjId(37));
+        /* The compositor's answers to callbacks answered here are dropped; what else reaches the
+         * program meanwhile is returned */
+        let answer = |ctx: &mut ProtocolTestContext, cbs: &[ObjId]| {
+            let (rmsg, _) = ctx
+                .comp_write(
+                    &build_msgs(|dst| {
+                        for &cb in cbs {
+                            write_evt_wl_callback_done(dst, cb, 1);
+                        }
+                    }),
+                    &[],
+                )
+                .unwrap();
+            assert!(cbs.iter().all(|&cb| dones(&rmsg, cb) == 0));
+            rmsg
+        };
+        answer(&mut ctx, &[cb3, cb4, cb5]);
+        let mut got = Vec::new();
+        ctx.prog_write_replies(&new_frame(cb_a), &[], &mut got);
+        ctx.prog_wait_for(&mut got, &is_done(cb_a));
+        std::thread::sleep(Duration::from_millis(400));
+        ctx.prog_write_replies(&new_frame(cb_b), &[], &mut got);
+        ctx.prog_write_replies(
+            &build_msgs(|dst| {
+                write_req_wl_compositor_create_surface(dst, comp, surface3);
+                write_req_wl_surface_frame(dst, surface3, cb_c);
+                write_req_wl_surface_commit(dst, surface3);
+            }),
+            &[],
+            &mut got,
+        );
+        ctx.prog_wait_for(&mut got, &is_done(cb_c));
+        assert!(dones(&got, cb_b) == 0);
+        got.extend(answer(&mut ctx, &[cb_a]));
+        ctx.prog_wait_for(&mut got, &is_done(cb_b));
+        assert!(dones(&got, cb_b) == 1);
+        answer(&mut ctx, &[cb_b, cb_c]);
+
+        ctx.prog_write_passthrough(build_msgs(|dst| {
+            write_req_wl_compositor_create_surface(dst, comp, surface2);
+        }));
+
+        /* Once the compositor has held a callback answered here for over a second, as it does
+         * for a hidden surface, the surface's next callbacks are left to it */
+        let mut got = Vec::new();
+        ctx.prog_write_replies(&new_frame(cb8), &[], &mut got);
+        ctx.prog_wait_for(&mut got, &is_done(cb8));
+        std::thread::sleep(Duration::from_millis(1100));
+        ctx.prog_write_replies(&new_frame(cb9), &[], &mut got);
+        /* Another surface's callback, due after this one, is still answered here */
+        let cb10 = ObjId(29);
+        ctx.prog_write_replies(
+            &build_msgs(|dst| {
+                write_req_wl_surface_frame(dst, surface2, cb10);
+                write_req_wl_surface_commit(dst, surface2);
+            }),
+            &[],
+            &mut got,
+        );
+        ctx.prog_wait_for(&mut got, &is_done(cb10));
+        assert!(dones(&got, cb9) == 0);
+        let (rmsg, _) = ctx
+            .comp_write(
+                &build_msgs(|dst| {
+                    write_evt_wl_callback_done(dst, cb8, 1);
+                    write_evt_wl_callback_done(dst, cb9, 2);
+                }),
+                &[],
+            )
+            .unwrap();
+        let rdones: Vec<_> = rmsg.iter().filter_map(|m| callback_done(m)).collect();
+        assert!(rdones.len() == 1 && rdones[0].0 == cb9);
+    })?;
+    Ok(StatusOk::Pass)
 }
 
 /** Test that very long messages are either cleanly accepted or cleanly rejected. */
@@ -4415,6 +4716,7 @@ fn proto_title_prefix(info: TestInfo) -> TestResult {
         let prefix = String::from("a").repeat(prefix_len);
         let options = WaypipeOptions {
             wire_version: None,
+            frame_rate: 0,
             drm_node: None,
             device_type: RenderDeviceType::Vulkan,
             video: VideoSetting::default(),
@@ -5277,6 +5579,7 @@ fn main() -> ExitCode {
     register_single(t, &f, "damage_efficiency", proto_damage_efficiency);
     register_single(t, &f, "fixes", proto_fixes);
     register_single(t, &f, "flip_damage", proto_flip_damage);
+    register_single(t, &f, "frame_rate", proto_frame_rate);
     register_single(t, &f, "gamma_control", proto_gamma_control);
     register_single(t, &f, "keymap", proto_keymap);
     register_single(t, &f, "icc", proto_icc);

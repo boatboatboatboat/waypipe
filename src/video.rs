@@ -1299,8 +1299,8 @@ pub fn supports_video_format(
     vulk: &VulkanDevice,
     fmt: VideoFormat,
     drm_format: u32,
-    _width: u32,
-    _height: u32,
+    width: u32,
+    height: u32,
 ) -> bool {
     let Some(ref vid) = vulk.video else {
         return false;
@@ -1325,15 +1325,26 @@ pub fn supports_video_format(
     };
 
     // TODO: lookup max size available for format
+    /* A hardware encoder serves a buffer setup_video_encode() sends to it, so a buffer of at
+     * least its minimum size needs no software encoder */
     match fmt {
         VideoFormat::H264 => {
-            !vid.codecs_h264.sw_decoder.is_null() && !vid.codecs_h264.sw_encoder.is_null()
+            let hw_enc = vid.can_hw_enc_h264
+                && !vid.codecs_h264.encoder.is_null()
+                && width >= MIN_H264_HW_SIZE.0
+                && height >= MIN_H264_HW_SIZE.1;
+            !vid.codecs_h264.sw_decoder.is_null()
+                && (hw_enc || !vid.codecs_h264.sw_encoder.is_null())
         }
         VideoFormat::VP9 => {
             !vid.codecs_vp9.sw_decoder.is_null() && !vid.codecs_vp9.sw_encoder.is_null()
         }
         VideoFormat::AV1 => {
-            !vid.codecs_av1.sw_decoder.is_null() && !vid.codecs_av1.sw_encoder.is_null()
+            let hw_enc = vid.can_hw_enc_av1
+                && !vid.codecs_av1.encoder.is_null()
+                && width >= MIN_AV1_HW_ENC_SIZE.0
+                && height >= MIN_AV1_HW_ENC_SIZE.1;
+            !vid.codecs_av1.sw_decoder.is_null() && (hw_enc || !vid.codecs_av1.sw_encoder.is_null())
         }
     }
 }

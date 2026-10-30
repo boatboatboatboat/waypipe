@@ -10,6 +10,10 @@ layout(push_constant) uniform constants {
   int stride_y;
   int stride_u;
   int stride_v;
+  /* For a buffer with alpha, the frame row where its alpha plane starts (as
+   * luma, under neutral chroma); else 0. A multiple of 16, so no 2x2 block
+   * straddles it */
+  int alpha_offset;
 }
 push;
 
@@ -18,6 +22,26 @@ push;
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 void main() {
   ivec2 rgbdim = textureSize(input_rgb, 0);
+
+  if (push.alpha_offset > 0 &&
+      2 * int(gl_GlobalInvocationID.y) >= push.alpha_offset) {
+    for (int i = 0; i < 2; i++) {
+      for (int j = 0; j < 2; j++) {
+        ivec2 pos = ivec2(2 * gl_GlobalInvocationID.x + i,
+                          2 * gl_GlobalInvocationID.y + j);
+        vec2 sample_pos = vec2(pos.x, pos.y - push.alpha_offset) + 0.5;
+        float a = texture(input_rgb, sample_pos).a;
+        imageStore(output_y, pos.y * push.stride_y + pos.x,
+                   vec4(a, 1., 1., 1.));
+      }
+    }
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    imageStore(output_v, pos.y * push.stride_v + pos.x,
+               vec4(128. / 255., 1., 1., 1.));
+    imageStore(output_u, pos.y * push.stride_u + pos.x,
+               vec4(128. / 255., 1., 1., 1.));
+    return;
+  }
 
   vec4 avg = vec4(0.);
   for (int i = 0; i < 2; i++) {

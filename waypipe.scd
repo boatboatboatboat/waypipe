@@ -132,8 +132,10 @@ compressible as images containing pictures.
 	Only for server mode; on shutdown, unlink the Unix socket that waypipe connects to.
 
 *--video V*
-	Compress specific DMABUF formats using a lossy video codec. Opaque, 10-bit, and
-	multiplanar formats, among others, are not supported. *V* is a comma separated 
+	Compress specific DMABUF formats using a lossy video codec: XRGB, XBGR, ARGB
+	and ABGR at 8 and 10 bits per channel, XRGB and XBGR at 16, RGB565 and
+	BGR565. A format with alpha carries its alpha in the video frames, below the
+	picture. Multiplanar formats, among others, are not supported. *V* is a comma separated
 	list of options to control the video encoding. (For example: *--video av1,hw*.)
 	Later options supersede earlier ones.
 

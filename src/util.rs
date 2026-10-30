@@ -51,7 +51,10 @@ macro_rules! tag {
  * with original Waypipe.
  */
 pub const MIN_PROTOCOL_VERSION: u32 = 0x10;
-pub const WAYPIPE_PROTOCOL_VERSION: u32 = 0x11;
+pub const WAYPIPE_PROTOCOL_VERSION: u32 = 0x12;
+/** The first version whose display side decodes video of buffers with alpha, carried below the
+ * picture */
+pub const ALPHA_VIDEO_PROTOCOL_VERSION: u32 = 0x12;
 pub const CONN_FIXED_BIT: u32 = 0x1 << 7;
 pub const CONN_UNSET_BIT: u32 = 0x1 << 31;
 pub const _CONN_RECONNECTABLE_BIT: u32 = 0x1 << 0;

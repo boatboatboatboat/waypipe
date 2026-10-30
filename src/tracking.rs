@@ -2672,6 +2672,7 @@ pub fn process_way_msg(
                         &mut glob.max_local_id,
                         &mut glob.map,
                         buffer_id,
+                        glob.wire_version,
                     )?;
                     y.push(sfd.clone());
 
@@ -2802,6 +2803,7 @@ pub fn process_way_msg(
                         &mut glob.max_local_id,
                         &mut glob.map,
                         ObjId(0),
+                        glob.wire_version,
                     )?;
                     y.push(sfd.clone());
 

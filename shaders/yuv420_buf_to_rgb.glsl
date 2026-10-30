@@ -10,6 +10,9 @@ layout(push_constant) uniform constants {
   int stride_y;
   int stride_u;
   int stride_v;
+  /* For a buffer with alpha, the frame row where its alpha plane starts (as
+   * luma); else 0 */
+  int alpha_offset;
 }
 push;
 
@@ -30,8 +33,16 @@ void main() {
   float r = texelFetch(input_u, u_pos).r;
   vec4 ybro = vec4(y, b, r, 1.0);
   vec3 rgb = transpose(push.ybr_to_rgb) * ybro;
+  float a = 1.0;
+  if (push.alpha_offset > 0) {
+    a = texelFetch(input_y, (pos.y + push.alpha_offset) * push.stride_y + pos.x)
+            .r;
+    /* Premultiplied color must not exceed alpha, which lossy coding can make
+     * it do */
+    rgb = min(rgb, vec3(a));
+  }
 
-  vec4 val = vec4(rgb, 1);
+  vec4 val = vec4(rgb, a);
   ivec2 opos = ivec2(gl_GlobalInvocationID.xy);
   if (opos.x < outdim.x && opos.y < outdim.y) {
     imageStore(output_img, opos, val);

@@ -206,6 +206,8 @@ pub struct VideoDecodeState {
     output_image_view: vk::ImageView,
     /* State specific to hardware vs software decoding pathways */
     data: VideoDecodeStateData,
+    /* The frame row where the alpha plane starts, or 0 (alpha_offset()) */
+    alpha_offset: u32,
 }
 
 struct VideoEncodeInner {
@@ -224,6 +226,8 @@ pub struct VideoEncodeState {
     output_image_view: vk::ImageView,
     /* State specific to hardware vs software encoding pathways */
     data: VideoEncodeStateData,
+    /* The frame row where the alpha plane starts, or 0 (alpha_offset()) */
+    alpha_offset: u32,
 }
 
 impl Drop for VideoDecodeState {
@@ -472,6 +476,30 @@ fn align_size(width: u32, height: u32, format: VideoFormat) -> (i32, i32) {
     let h = height.next_multiple_of(16) as i32;
     (w, h)
 }
+
+/** Video carries no alpha channel, so a buffer with alpha travels as frames holding its picture
+ * and, below it, its alpha as luma under neutral chroma, starting at this row; 0 for a buffer
+ * without alpha. A multiple of 16, so no H.264 macroblock mixes picture and alpha. */
+fn alpha_offset(has_alpha: bool, height: u32) -> u32 {
+    if has_alpha {
+        height.next_multiple_of(16)
+    } else {
+        0
+    }
+}
+
+/** The rows a buffer's video frames hold: its picture, then its alpha plane, if any */
+fn video_rows(alpha_offset: u32, height: u32) -> u32 {
+    if alpha_offset > 0 {
+        alpha_offset + height
+    } else {
+        height
+    }
+}
+
+/** The tallest frame a buffer with alpha may need: Intel's, AMD's and NVIDIA's Vulkan H.264
+ * encoders and decoders report 4096x4096 as their largest coded frame */
+const MAX_ALPHA_VIDEO_ROWS: u32 = 4096;
 
 fn set_context_extensions(
     bindings: &ffmpeg,
@@ -762,7 +790,8 @@ pub unsafe fn setup_video(
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
-    let nv12_img_to_rgb = create_compute_pipeline(dev, NV12_IMG_TO_RGB, bindings, 4 * 3 * 4)?;
+    /* push constants: the color matrix, then the alpha plane's offset */
+    let nv12_img_to_rgb = create_compute_pipeline(dev, NV12_IMG_TO_RGB, bindings, 4 * 3 * 4 + 4)?;
     let bindings = &[
         vk::DescriptorSetLayoutBinding::default()
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -780,7 +809,7 @@ pub unsafe fn setup_video(
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
-    let rgb_to_nv12_img = create_compute_pipeline(dev, RGB_TO_NV12_IMG, bindings, 4 * 3 * 4)?;
+    let rgb_to_nv12_img = create_compute_pipeline(dev, RGB_TO_NV12_IMG, bindings, 4 * 3 * 4 + 4)?;
 
     let bindings = &[
         vk::DescriptorSetLayoutBinding::default()
@@ -805,7 +834,7 @@ pub unsafe fn setup_video(
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
     let rgb_to_yuv420_buf =
-        create_compute_pipeline(dev, RGB_TO_YUV420_BUF, bindings, 4 * 3 * 4 + 3 * 4)?;
+        create_compute_pipeline(dev, RGB_TO_YUV420_BUF, bindings, 4 * 3 * 4 + 4 * 4)?;
     let bindings = &[
         vk::DescriptorSetLayoutBinding::default()
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
@@ -829,7 +858,7 @@ pub unsafe fn setup_video(
             .stage_flags(vk::ShaderStageFlags::COMPUTE),
     ];
     let yuv420_buf_to_rgb =
-        create_compute_pipeline(dev, YUV420_BUF_TO_RGB, bindings, 4 * 3 * 4 + 3 * 4)?;
+        create_compute_pipeline(dev, YUV420_BUF_TO_RGB, bindings, 4 * 3 * 4 + 4 * 4)?;
 
     let rect_lin_sampler = vk::SamplerCreateInfo::default()
         .flags(vk::SamplerCreateFlags::empty())
@@ -1153,6 +1182,7 @@ fn create_dmabuf_view(img: &VulkanDmabuf) -> Result<vk::ImageView, String> {
 pub fn setup_video_decode_hw(
     img: &Arc<VulkanDmabuf>,
     fmt: VideoFormat,
+    alpha_offset: u32,
 ) -> Result<VideoDecodeState, String> {
     let video = img.vulk.video.as_ref().unwrap();
 
@@ -1168,7 +1198,7 @@ pub fn setup_video_decode_hw(
             return Err(tag!("Failed to allocate context"));
         }
 
-        let (awidth, aheight) = align_size(img.width, img.height, fmt);
+        let (awidth, aheight) = align_size(img.width, video_rows(alpha_offset, img.height), fmt);
         {
             let cr = ctx.as_mut().unwrap();
 
@@ -1203,6 +1233,7 @@ pub fn setup_video_decode_hw(
             inner: Mutex::new(VideoDecodeInner { ctx }),
             output_image_view,
             data: VideoDecodeStateData::HW(staging_images),
+            alpha_offset,
         })
     }
 }
@@ -1227,6 +1258,7 @@ unsafe extern "C" fn pick_video_format_sw(_ctx: *mut AVCodecContext, fmts: *cons
 pub fn setup_video_decode_sw(
     img: &Arc<VulkanDmabuf>,
     fmt: VideoFormat,
+    alpha_offset: u32,
 ) -> Result<VideoDecodeState, String> {
     let video = img.vulk.video.as_ref().unwrap();
     let decoder: *const AVCodec = match fmt {
@@ -1246,7 +1278,8 @@ pub fn setup_video_decode_sw(
             cr.opaque = &video.bindings as *const ffmpeg as *mut _;
             cr.get_format = Some(pick_video_format_sw);
 
-            (cr.width, cr.height) = align_size(img.width, img.height, fmt);
+            (cr.width, cr.height) =
+                align_size(img.width, video_rows(alpha_offset, img.height), fmt);
         }
 
         /* ctx->get_format will be called to do setup work once a packet is received */
@@ -1259,6 +1292,7 @@ pub fn setup_video_decode_sw(
             inner: Mutex::new(VideoDecodeInner { ctx }),
             output_image_view,
             data: VideoDecodeStateData::SW,
+            alpha_offset,
         })
     }
 }
@@ -1275,8 +1309,10 @@ const MIN_AV1_HW_ENC_SIZE: (u32, u32) = (128, 128);
 pub fn setup_video_decode(
     img: &Arc<VulkanDmabuf>,
     fmt: VideoFormat,
+    drm_format: u32,
 ) -> Result<VideoDecodeState, String> {
     assert!(img.can_store_and_sample);
+    let alpha_offset = alpha_offset(video_drm_format_has_alpha(drm_format), img.height);
     let video = img.vulk.video.as_ref().unwrap();
     let can_hw_decode = match fmt {
         VideoFormat::AV1 => video.can_hw_dec_av1 && !video.codecs_av1.decoder.is_null(),
@@ -1289,9 +1325,78 @@ pub fn setup_video_decode(
     };
 
     if can_hw_decode {
-        setup_video_decode_hw(img, fmt)
+        setup_video_decode_hw(img, fmt, alpha_offset)
     } else {
-        setup_video_decode_sw(img, fmt)
+        setup_video_decode_sw(img, fmt, alpha_offset)
+    }
+}
+
+/** Whether buffers of this DRM format have an alpha channel, which their video frames carry
+ * below the picture (alpha_offset()) */
+pub fn video_drm_format_has_alpha(drm_format: u32) -> bool {
+    let Ok(wlfmt) = TryInto::<WlShmFormat>::try_into(drm_to_wayland(drm_format)) else {
+        return false;
+    };
+    matches!(
+        wlfmt,
+        WlShmFormat::Argb8888
+            | WlShmFormat::Abgr8888
+            | WlShmFormat::Argb2101010
+            | WlShmFormat::Abgr2101010
+    )
+}
+
+/** Whether buffers of this DRM format and height may be sent as video */
+fn is_video_drm_format(drm_format: u32, height: u32) -> bool {
+    if video_drm_format_has_alpha(drm_format) {
+        return video_rows(alpha_offset(true, height), height) <= MAX_ALPHA_VIDEO_ROWS;
+    }
+    let Ok(wlfmt) = TryInto::<WlShmFormat>::try_into(drm_to_wayland(drm_format)) else {
+        return false;
+    };
+    matches!(
+        wlfmt,
+        WlShmFormat::Rgb565
+            | WlShmFormat::Bgr565
+            | WlShmFormat::Xrgb8888
+            | WlShmFormat::Xbgr8888
+            // These exceed the bit depth of the video formats, but video is already lossy.
+            // 10-bit encoding is still probably worth using if fast
+            | WlShmFormat::Xrgb2101010
+            | WlShmFormat::Xbgr2101010
+            | WlShmFormat::Xrgb16161616
+            | WlShmFormat::Xbgr16161616
+    )
+}
+
+/** Whether a video stream for a buffer of this format and size can be decoded here, by the
+ * decoder setup_video_decode() picks for it; unlike sending, receiving needs no encoder */
+pub fn supports_video_decode(
+    vulk: &VulkanDevice,
+    fmt: VideoFormat,
+    drm_format: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    let Some(ref vid) = vulk.video else {
+        return false;
+    };
+    if !is_video_drm_format(drm_format, height) {
+        return false;
+    }
+    match fmt {
+        VideoFormat::H264 => {
+            let hw_dec = vid.can_hw_dec_h264
+                && !vid.codecs_h264.decoder.is_null()
+                && width >= MIN_H264_HW_SIZE.0
+                && height >= MIN_H264_HW_SIZE.1;
+            hw_dec || !vid.codecs_h264.sw_decoder.is_null()
+        }
+        VideoFormat::VP9 => !vid.codecs_vp9.sw_decoder.is_null(),
+        VideoFormat::AV1 => {
+            let hw_dec = vid.can_hw_dec_av1 && !vid.codecs_av1.decoder.is_null();
+            hw_dec || !vid.codecs_av1.sw_decoder.is_null()
+        }
     }
 }
 
@@ -1299,41 +1404,35 @@ pub fn supports_video_format(
     vulk: &VulkanDevice,
     fmt: VideoFormat,
     drm_format: u32,
-    _width: u32,
-    _height: u32,
+    width: u32,
+    height: u32,
 ) -> bool {
     let Some(ref vid) = vulk.video else {
         return false;
     };
-    let Ok(wlfmt) = TryInto::<WlShmFormat>::try_into(drm_to_wayland(drm_format)) else {
+    if !is_video_drm_format(drm_format, height) {
         return false;
-    };
-    match wlfmt {
-        WlShmFormat::Rgb565 => (),
-        WlShmFormat::Bgr565 => (),
-        WlShmFormat::Xrgb8888 => (),
-        WlShmFormat::Xbgr8888 => (),
-        // These exceed the bit depth of the video formats, but video is already lossy.
-        // 10-bit encoding is still probably worth using if fast
-        WlShmFormat::Xrgb2101010 => (),
-        WlShmFormat::Xbgr2101010 => (),
-        WlShmFormat::Xrgb16161616 => (),
-        WlShmFormat::Xbgr16161616 => (),
-        _ => {
-            return false;
-        }
-    };
+    }
 
     // TODO: lookup max size available for format
+    /* Only the encoder matters here; the receiving end checks its decoder with
+     * supports_video_decode(). A hardware encoder serves a buffer setup_video_encode() sends to
+     * it, so a buffer of at least its minimum size needs no software encoder */
     match fmt {
         VideoFormat::H264 => {
-            !vid.codecs_h264.sw_decoder.is_null() && !vid.codecs_h264.sw_encoder.is_null()
+            let hw_enc = vid.can_hw_enc_h264
+                && !vid.codecs_h264.encoder.is_null()
+                && width >= MIN_H264_HW_SIZE.0
+                && height >= MIN_H264_HW_SIZE.1;
+            hw_enc || !vid.codecs_h264.sw_encoder.is_null()
         }
-        VideoFormat::VP9 => {
-            !vid.codecs_vp9.sw_decoder.is_null() && !vid.codecs_vp9.sw_encoder.is_null()
-        }
+        VideoFormat::VP9 => !vid.codecs_vp9.sw_encoder.is_null(),
         VideoFormat::AV1 => {
-            !vid.codecs_av1.sw_decoder.is_null() && !vid.codecs_av1.sw_encoder.is_null()
+            let hw_enc = vid.can_hw_enc_av1
+                && !vid.codecs_av1.encoder.is_null()
+                && width >= MIN_AV1_HW_ENC_SIZE.0
+                && height >= MIN_AV1_HW_ENC_SIZE.1;
+            hw_enc || !vid.codecs_av1.sw_encoder.is_null()
         }
     }
 }
@@ -1445,13 +1544,14 @@ pub fn start_dmavid_decode_hw(
 
         // Permit arbitrary sizes larger than the actual image size, in case
         // video encoding constraints get relaxed in the future.
-        if frame_width < state.target.width || frame_height < state.target.height {
+        let rows = video_rows(state.alpha_offset, state.target.height);
+        if frame_width < state.target.width || frame_height < rows {
             return Err(tag!(
                 "Stream image size {}x{} is too small (< {}x{})",
                 frame_width,
                 frame_height,
                 state.target.width,
-                state.target.height
+                rows
             ));
         }
 
@@ -1706,7 +1806,9 @@ pub fn start_dmavid_decode_hw(
             video.nv12_img_to_rgb.pipeline,
         );
 
-        let push_u8 = pack_glsl_mat3x4(YUV_TO_RGB);
+        let mut push_u8: [u8; 52] = [0; 52];
+        push_u8[..48].copy_from_slice(&pack_glsl_mat3x4(YUV_TO_RGB));
+        push_u8[48..52].copy_from_slice(&(state.alpha_offset as i32).to_le_bytes());
         vulk.dev.cmd_push_constants(
             cb,
             video.nv12_img_to_rgb.pipeline_layout,
@@ -1852,15 +1954,16 @@ pub fn start_dmavid_decode_sw(
         let frame_height = u32::try_from((*frame).height).unwrap();
         assert!(frame_width % 2 == 0 && frame_height % 2 == 0);
 
-        if frame_width < 8 * state.target.width.div_ceil(8)
-            || frame_height < 8 * state.target.height.div_ceil(8)
-        {
+        /* The conversion reads whole 8x8 groups of the picture, and for a buffer with alpha
+         * the same rows again below alpha_offset */
+        let rows = state.alpha_offset + 8 * state.target.height.div_ceil(8);
+        if frame_width < 8 * state.target.width.div_ceil(8) || frame_height < rows {
             return Err(tag!(
                 "Stream image size {}x{} is too small (< {}x{} input size for yuv conversion)",
                 frame_width,
                 frame_height,
                 8 * state.target.width.div_ceil(8),
-                8 * state.target.height.div_ceil(8)
+                rows
             ));
         }
 
@@ -2076,11 +2179,12 @@ pub fn start_dmavid_decode_sw(
         );
 
         let push_u8_mtx = pack_glsl_mat3x4(YUV_TO_RGB);
-        let mut push_u8: [u8; 60] = [0; 60];
+        let mut push_u8: [u8; 64] = [0; 64];
         push_u8[..48].copy_from_slice(&push_u8_mtx);
         push_u8[48..52].copy_from_slice(&(stride_y as i32).to_le_bytes());
         push_u8[52..56].copy_from_slice(&(stride_u as i32).to_le_bytes());
         push_u8[56..60].copy_from_slice(&(stride_v as i32).to_le_bytes());
+        push_u8[60..64].copy_from_slice(&(state.alpha_offset as i32).to_le_bytes());
         vulk.dev.cmd_push_constants(
             cb,
             video.yuv420_buf_to_rgb.pipeline_layout,
@@ -2215,6 +2319,7 @@ pub fn setup_video_encode_hw(
     img: &Arc<VulkanDmabuf>,
     fmt: VideoFormat,
     bpf: Option<f32>,
+    alpha_offset: u32,
 ) -> Result<VideoEncodeState, String> {
     let video = img.vulk.video.as_ref().unwrap();
 
@@ -2235,7 +2340,8 @@ pub fn setup_video_encode_hw(
             return Err(tag!("Failed to allocate hardware frames context"));
         }
 
-        let (frame_width, frame_height) = align_size(img.width, img.height, fmt);
+        let (frame_width, frame_height) =
+            align_size(img.width, video_rows(alpha_offset, img.height), fmt);
 
         {
             let hr = (*hctx_ref)
@@ -2318,6 +2424,7 @@ pub fn setup_video_encode_hw(
             inner: Mutex::new(VideoEncodeInner { ctx }),
             output_image_view,
             data: VideoEncodeStateData::HW(staging_images),
+            alpha_offset,
         })
     }
 }
@@ -2326,6 +2433,7 @@ pub fn setup_video_encode_sw(
     img: &Arc<VulkanDmabuf>,
     fmt: VideoFormat,
     bpf: Option<f32>,
+    alpha_offset: u32,
 ) -> Result<VideoEncodeState, String> {
     let video = img.vulk.video.as_ref().unwrap();
 
@@ -2341,7 +2449,8 @@ pub fn setup_video_encode_sw(
             return Err(tag!("Failed to allocate codec context"));
         }
 
-        let (frame_width, frame_height) = align_size(img.width, img.height, fmt);
+        let (frame_width, frame_height) =
+            align_size(img.width, video_rows(alpha_offset, img.height), fmt);
 
         {
             let cr = ctx.as_mut().unwrap();
@@ -2409,6 +2518,7 @@ pub fn setup_video_encode_sw(
             inner: Mutex::new(VideoEncodeInner { ctx }),
             output_image_view,
             data: VideoEncodeStateData::SW,
+            alpha_offset,
         })
     }
 }
@@ -2417,8 +2527,10 @@ pub fn setup_video_encode(
     img: &Arc<VulkanDmabuf>,
     fmt: VideoFormat,
     bpf: Option<f32>,
+    drm_format: u32,
 ) -> Result<VideoEncodeState, String> {
     assert!(img.can_store_and_sample);
+    let alpha_offset = alpha_offset(video_drm_format_has_alpha(drm_format), img.height);
     let video = img.vulk.video.as_ref().unwrap();
     let can_hw_encode = match fmt {
         VideoFormat::AV1 => {
@@ -2434,9 +2546,9 @@ pub fn setup_video_encode(
         }
     };
     if can_hw_encode {
-        setup_video_encode_hw(img, fmt, bpf)
+        setup_video_encode_hw(img, fmt, bpf, alpha_offset)
     } else {
-        setup_video_encode_sw(img, fmt, bpf)
+        setup_video_encode_sw(img, fmt, bpf, alpha_offset)
     }
 }
 
@@ -2654,7 +2766,9 @@ pub fn start_dmavid_encode_hw(
             bind_descs,
             &[],
         );
-        let push_u8 = pack_glsl_mat3x4(RGB_TO_YUV);
+        let mut push_u8: [u8; 52] = [0; 52];
+        push_u8[..48].copy_from_slice(&pack_glsl_mat3x4(RGB_TO_YUV));
+        push_u8[48..52].copy_from_slice(&(state.alpha_offset as i32).to_le_bytes());
         vulk.dev.cmd_push_constants(
             cb,
             video.rgb_to_nv12_img.pipeline_layout,
@@ -3042,11 +3156,12 @@ pub fn start_dmavid_encode_sw(
             &[],
         );
         let push_u8_mtx = pack_glsl_mat3x4(RGB_TO_YUV);
-        let mut push_u8: [u8; 60] = [0; 60];
+        let mut push_u8: [u8; 64] = [0; 64];
         push_u8[..48].copy_from_slice(&push_u8_mtx);
         push_u8[48..52].copy_from_slice(&(stride_y as i32).to_le_bytes());
         push_u8[52..56].copy_from_slice(&(stride_u as i32).to_le_bytes());
         push_u8[56..60].copy_from_slice(&(stride_v as i32).to_le_bytes());
+        push_u8[60..64].copy_from_slice(&(state.alpha_offset as i32).to_le_bytes());
         vulk.dev.cmd_push_constants(
             cb,
             video.rgb_to_yuv420_buf.pipeline_layout,
@@ -3239,9 +3354,9 @@ pub fn start_dmavid_encode(
     }
 }
 
-/* Fill with specified RGB color */
+/* Fill with specified RGB color, and the given alpha where the format has alpha */
 #[cfg(test)]
-fn fill_with_color(w: usize, h: usize, format: u32, color: (f32, f32, f32)) -> Vec<u8> {
+fn fill_with_color(w: usize, h: usize, format: u32, color: (f32, f32, f32), alpha: f32) -> Vec<u8> {
     use crate::wayland_gen::*;
 
     fn scale_to_u(b: f32, bits: u8) -> u32 {
@@ -3303,9 +3418,36 @@ fn fill_with_color(w: usize, h: usize, format: u32, color: (f32, f32, f32)) -> V
         WlShmFormat::Xbgr16161616 => {
             replicate(&pack16161616(color.0, color.1, color.2, 1.0), w * h)
         }
+        WlShmFormat::Argb8888 => replicate(&pack8888(color.2, color.1, color.0, alpha), w * h),
+        WlShmFormat::Abgr8888 => replicate(&pack8888(color.0, color.1, color.2, alpha), w * h),
+        WlShmFormat::Argb2101010 => {
+            replicate(&pack2101010(color.2, color.1, color.0, alpha), w * h)
+        }
+        WlShmFormat::Abgr2101010 => {
+            replicate(&pack2101010(color.0, color.1, color.2, alpha), w * h)
+        }
 
         _ => todo!(),
     }
+}
+
+/* Average alpha of an image in a format with alpha (video_drm_format_has_alpha) */
+#[cfg(test)]
+fn get_average_alpha(w: usize, h: usize, format: u32, data: &[u8]) -> f32 {
+    use crate::wayland_gen::*;
+
+    let sum: f32 = match drm_to_wayland(format).try_into().unwrap() {
+        WlShmFormat::Argb8888 | WlShmFormat::Abgr8888 => data[..4 * w * h]
+            .chunks_exact(4)
+            .map(|x| x[3] as f32 / 255.)
+            .sum(),
+        WlShmFormat::Argb2101010 | WlShmFormat::Abgr2101010 => data[..4 * w * h]
+            .chunks_exact(4)
+            .map(|x| (u32::from_le_bytes(x.try_into().unwrap()) >> 30) as f32 / 3.)
+            .sum(),
+        _ => unreachable!(),
+    };
+    sum / ((w * h) as f32)
 }
 
 #[cfg(test)]
@@ -3404,6 +3546,22 @@ fn get_average_color(w: usize, h: usize, format: u32, data: &[u8]) -> (f32, f32,
             .chunks_exact(8)
             .map(|x| swizzle_rgbx(unpack16161616(x)))
             .fold(base, add_color),
+        WlShmFormat::Argb8888 => data
+            .chunks_exact(4)
+            .map(|x| swizzle_bgrx(unpack8888(x)))
+            .fold(base, add_color),
+        WlShmFormat::Abgr8888 => data
+            .chunks_exact(4)
+            .map(|x| swizzle_rgbx(unpack8888(x)))
+            .fold(base, add_color),
+        WlShmFormat::Argb2101010 => data
+            .chunks_exact(4)
+            .map(|x| swizzle_bgrx(unpack2101010(x)))
+            .fold(base, add_color),
+        WlShmFormat::Abgr2101010 => data
+            .chunks_exact(4)
+            .map(|x| swizzle_rgbx(unpack2101010(x)))
+            .fold(base, add_color),
 
         _ => todo!(),
     };
@@ -3446,13 +3604,19 @@ fn test_video(try_hardware: bool) {
         println!("Setup complete for device id {}", dev_id);
 
         /* Test relatively small image sizes, since many formats will be tested */
-        let sizes: [(usize, usize); 2] = [(63, 65), (1, 1)];
+        let small_sizes: &[(usize, usize)] = &[(63, 65), (1, 1)];
+        /* hardware coding needs at least MIN_H264_HW_SIZE */
+        let hw_sizes: &[(usize, usize)] = &[(256, 192), (63, 65), (1, 1)];
+        let sizes = if try_hardware { hw_sizes } else { small_sizes };
 
         for video_format in [VideoFormat::H264, VideoFormat::VP9, VideoFormat::AV1] {
             let mut format_modifiers = Vec::<(u32, u64, bool)>::new();
             'scan: for f in DRM_FORMATS {
                 for s in sizes {
-                    if !supports_video_format(&vulk, video_format, *f, s.0 as u32, s.1 as u32) {
+                    let (w, h) = (s.0 as u32, s.1 as u32);
+                    if !supports_video_format(&vulk, video_format, *f, w, h)
+                        || !supports_video_decode(&vulk, video_format, *f, w, h)
+                    {
                         continue 'scan;
                     }
                 }
@@ -3488,7 +3652,7 @@ fn test_video(try_hardware: bool) {
 
                 let mut color_errs = Vec::new();
                 let mut elapsed_times = Vec::new();
-                for (w, h) in sizes {
+                for &(w, h) in sizes {
                     let mod_options = &[modifier];
                     let (dmabuf1, planes) =
                         vulkan_create_dmabuf(&vulk, w as u32, h as u32, format, mod_options, true)
@@ -3501,8 +3665,9 @@ fn test_video(try_hardware: bool) {
                     drop(planes);
 
                     let enc_state =
-                        Arc::new(setup_video_encode(&dmabuf1, video_format, None).unwrap());
-                    let dec_state = Arc::new(setup_video_decode(&dmabuf2, video_format).unwrap());
+                        Arc::new(setup_video_encode(&dmabuf1, video_format, None, format).unwrap());
+                    let dec_state =
+                        Arc::new(setup_video_decode(&dmabuf2, video_format, format).unwrap());
 
                     println!(
                         "Enc is sw: {}, Dec is sw: {}",
@@ -3528,9 +3693,24 @@ fn test_video(try_hardware: bool) {
                     let colors_short = &[(1.0, 0.5, 0.2), (0.3, 0.0, 0.7)];
                     let colors: &[(f32, f32, f32)] =
                         if *first { colors_long } else { colors_short };
+                    /* Transparent first, then opaque: what a new popup's buffer sees. At 1x1,
+                     * libaom's AV1 already errs near its threshold on opaque frames, and the
+                     * frame after an alpha change crosses it, so alpha stays fixed there. */
+                    let alphas: &[f32] = if (w, h) == (1, 1) {
+                        &[2.0 / 3.0]
+                    } else {
+                        &[0.0, 1.0, 2.0 / 3.0]
+                    };
                     let mut net_err = 0.0;
-                    for color in colors {
-                        let data = fill_with_color(w, h, format, *color);
+                    for (k, color) in colors.iter().enumerate() {
+                        let alpha = alphas[k % alphas.len()];
+                        /* Wayland's formats with alpha hold premultiplied color */
+                        let color = &if video_drm_format_has_alpha(format) {
+                            (color.0 * alpha, color.1 * alpha, color.2 * alpha)
+                        } else {
+                            *color
+                        };
+                        let data = fill_with_color(w, h, format, *color, alpha);
                         let check = get_average_color(w, h, format, &data);
 
                         copy_onto_dmabuf(&dmabuf1, &copy1, &data).unwrap();
@@ -3543,6 +3723,18 @@ fn test_video(try_hardware: bool) {
 
                         let mirror = copy_from_dmabuf(&dmabuf2, &copy2).unwrap();
                         let output = get_average_color(w, h, format, &mirror);
+                        if video_drm_format_has_alpha(format)
+                            && (!try_hardware || (w >= 128 && h >= 128))
+                        {
+                            let out_alpha = get_average_alpha(w, h, format, &mirror);
+                            assert!(
+                                (out_alpha - alpha).abs() <= 0.05,
+                                "size: {:?} alpha: {} output alpha: {}",
+                                (w, h),
+                                alpha,
+                                out_alpha
+                            );
+                        }
 
                         let check_err = color_error(*color, check);
                         let rtrip_err = color_error(*color, output);
@@ -3578,6 +3770,41 @@ fn test_video(try_hardware: bool) {
                     let duration = end_time.duration_since(start_time);
                     elapsed_times.push(duration.as_secs_f32());
                     color_errs.push(net_err / (colors.len() as f32));
+
+                    /* A stream from a shorter buffer of the same width has frames tall enough
+                     * for this buffer's picture but not for its alpha rows; the display side
+                     * must refuse it rather than read alpha past the frame */
+                    let h_short = (h * 5 / 8) & !1;
+                    if video_drm_format_has_alpha(format) && h_short >= 16 {
+                        let (dmabuf3, planes) = vulkan_create_dmabuf(
+                            &vulk,
+                            w as u32,
+                            h_short as u32,
+                            format,
+                            mod_options,
+                            true,
+                        )
+                        .unwrap();
+                        drop(planes);
+                        let enc_short = Arc::new(
+                            setup_video_encode(&dmabuf3, video_format, None, format).unwrap(),
+                        );
+                        let copy3 = Arc::new(
+                            vulkan_get_buffer(&vulk, dmabuf3.nominal_size(None), false).unwrap(),
+                        );
+                        let data = fill_with_color(w, h_short, format, (0.5, 0.5, 0.5), 1.0);
+                        copy_onto_dmabuf(&dmabuf3, &copy3, &data).unwrap();
+                        let packet =
+                            start_dmavid_encode(&enc_short, &pool, Vec::new(), None).unwrap();
+                        if let Ok(op) = start_dmavid_apply(&dec_state, &pool, &packet) {
+                            let _ = op.wait_until_done();
+                            panic!(
+                                "size: {:?}: a frame from a {}-row buffer was accepted",
+                                (w, h),
+                                h_short
+                            );
+                        }
+                    }
                 }
                 println!(
                     "Tested sizes: {:?}; average errors: {:?}; times: {:?}",

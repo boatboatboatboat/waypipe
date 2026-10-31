@@ -4,7 +4,13 @@ layout(binding = 0) uniform sampler2D input_rgb;
 layout(binding = 1) uniform restrict writeonly image2D output_y;
 layout(binding = 2) uniform restrict writeonly image2D output_vu;
 
-layout(push_constant) uniform constants { mat3x4 rgb_to_yrb; }
+layout(push_constant) uniform constants {
+  mat3x4 rgb_to_yrb;
+  /* For a buffer with alpha, the frame row where its alpha plane starts (as
+   * luma, under neutral chroma); else 0. A multiple of 16, so no 2x2 block
+   * straddles it */
+  int alpha_offset;
+}
 push;
 
 /* Each individual task fills 2x2 pixels. */
@@ -14,6 +20,22 @@ void main() {
   ivec2 brdim = imageSize(output_vu);
   ivec2 ydim = imageSize(output_y);
   ivec2 rgbdim = textureSize(input_rgb, 0);
+
+  if (push.alpha_offset > 0 &&
+      2 * int(gl_GlobalInvocationID.y) >= push.alpha_offset) {
+    for (int i = 0; i < 2; i++) {
+      for (int j = 0; j < 2; j++) {
+        ivec2 pos = ivec2(2 * gl_GlobalInvocationID.x + i,
+                          2 * gl_GlobalInvocationID.y + j);
+        vec2 sample_pos = vec2(pos.x, pos.y - push.alpha_offset) + 0.5;
+        float a = texture(input_rgb, sample_pos).a;
+        imageStore(output_y, pos, vec4(a, 1., 1., 1.));
+      }
+    }
+    imageStore(output_vu, ivec2(gl_GlobalInvocationID.xy),
+               vec4(128. / 255., 128. / 255., 1., 1.));
+    return;
+  }
 
   vec4 avg = vec4(0.);
   for (int i = 0; i < 2; i++) {

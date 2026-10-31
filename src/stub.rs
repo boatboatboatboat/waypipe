@@ -331,6 +331,7 @@ mod video_stub {
     pub fn setup_video_decode(
         img: &Arc<VulkanDmabuf>,
         fmt: VideoFormat,
+        drm_format: u32,
     ) -> Result<VideoDecodeState, &'static str> {
         unreachable!();
     }
@@ -338,10 +339,23 @@ mod video_stub {
         img: &Arc<VulkanDmabuf>,
         fmt: VideoFormat,
         bpf: Option<f32>,
+        drm_format: u32,
     ) -> Result<VideoEncodeState, &'static str> {
         unreachable!();
     }
     pub fn supports_video_format(
+        vulk: &VulkanDevice,
+        fmt: VideoFormat,
+        drm_format: u32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        false
+    }
+    pub fn video_drm_format_has_alpha(drm_format: u32) -> bool {
+        false
+    }
+    pub fn supports_video_decode(
         vulk: &VulkanDevice,
         fmt: VideoFormat,
         drm_format: u32,

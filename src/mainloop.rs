@@ -157,7 +157,7 @@ pub struct Globals<'a> {
     /* Waypipe communication protocol version. For waypipe-client, this is fixed;
      * for waypipe-server, this may increase from the baseline 16 to the actual
      * version on receipt of the first message */
-    wire_version: u32,
+    pub wire_version: u32,
     /** Has the first message arrived and has had some processing done on it? */
     has_first_message: bool,
     /** Has a Close message arrived (implying a clean and deliberate connection shutdown). */
@@ -1184,6 +1184,7 @@ pub fn translate_dmabuf_fd(
     max_local_id: &mut i32,
     map: &mut BTreeMap<Rid, Weak<RefCell<ShadowFd>>>,
     wayland_id: ObjId,
+    wire_version: u32,
 ) -> Result<Rc<RefCell<ShadowFd>>, String> {
     let remote_id = allocate_rid(max_local_id);
 
@@ -1200,6 +1201,11 @@ pub fn translate_dmabuf_fd(
                 if supports_video_format(vulk, *f, drm_format, width, height) {
                     use_video = true;
                 }
+            }
+            if video_drm_format_has_alpha(drm_format) && wire_version < ALPHA_VIDEO_PROTOCOL_VERSION
+            {
+                /* The display side would refuse this buffer's video */
+                use_video = false;
             }
             if use_video {
                 if vulk
@@ -1223,6 +1229,7 @@ pub fn translate_dmabuf_fd(
                         &buf,
                         f,
                         opts.video.bits_per_frame,
+                        drm_format,
                     )?))
                 } else {
                     None
@@ -1736,9 +1743,9 @@ fn process_sfd_msg(
                     "Received OpenDMAVidDstV2 before Vulkan device was set up"
                 ));
             };
-            if !supports_video_format(vulk, vid_type, drm_format, width, height) {
+            if !supports_video_decode(vulk, vid_type, drm_format, width, height) {
                 return Err(tag!(
-                    "Video format {:?} at {}x{} is not supported",
+                    "Video format {:?} at {}x{} cannot be decoded",
                     vid_type,
                     width,
                     height
@@ -1764,7 +1771,7 @@ fn process_sfd_msg(
             )?;
             let drm_modifier = add_planes[0].modifier;
 
-            let video_decode_state = setup_video_decode(&buf, vid_type)?;
+            let video_decode_state = setup_video_decode(&buf, vid_type, drm_format)?;
 
             let sfd = Rc::new(RefCell::new(ShadowFd {
                 remote_id,

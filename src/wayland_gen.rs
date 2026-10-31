@@ -6460,6 +6460,23 @@ pub fn parse_req_xdg_wm_base_get_xdg_surface<'a>(
     Ok((arg1, arg2))
 }
 pub const OPCODE_XDG_WM_BASE_GET_XDG_SURFACE: MethodId = MethodId::Request(2);
+pub fn write_req_xdg_wm_base_pong(dst: &mut &mut [u8], for_id: ObjId, serial: u32) {
+    let l = length_req_xdg_wm_base_pong();
+    write_header(dst, for_id, l, 3, 0);
+    write_u32(dst, serial);
+}
+pub fn length_req_xdg_wm_base_pong() -> usize {
+    12
+}
+pub fn parse_req_xdg_wm_base_pong<'a>(mut msg: &'a [u8]) -> Result<u32, &'static str> {
+    msg = msg.get(8..).ok_or(PARSE_ERROR)?;
+    let arg1 = parse_u32(&mut msg)?;
+    if !msg.is_empty() {
+        return Err(PARSE_ERROR);
+    }
+    Ok(arg1)
+}
+pub const OPCODE_XDG_WM_BASE_PONG: MethodId = MethodId::Request(3);
 const DATA_XDG_WM_BASE: WaylandData = WaylandData {
     name: "xdg_wm_base",
     evts: &[WaylandMethod {

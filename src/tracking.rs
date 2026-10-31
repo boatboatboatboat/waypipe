@@ -1637,12 +1637,21 @@ pub fn process_way_msg(
                 | (WaylandInterface::WlDisplay, OPCODE_WL_DISPLAY_SYNC)
             )
         };
-        if !content {
-            glob.local_frames.content_only = false;
-        } else if !matches!(
+        /* A pong answers the compositor's ping, which may come many times a second while the
+         * pointer moves: no event replies to it and it changes nothing the program reads back,
+         * so the next sync is answered as if it had not come */
+        let pong = matches!(
             (obj.obj_type, mod_opcode),
-            (WaylandInterface::WlDisplay, OPCODE_WL_DISPLAY_SYNC)
-        ) {
+            (WaylandInterface::XdgWmBase, OPCODE_XDG_WM_BASE_PONG)
+        );
+        if !content && !pong {
+            glob.local_frames.content_only = false;
+        } else if content
+            && !matches!(
+                (obj.obj_type, mod_opcode),
+                (WaylandInterface::WlDisplay, OPCODE_WL_DISPLAY_SYNC)
+            )
+        {
             glob.local_frames.new_contents = true;
         }
     }

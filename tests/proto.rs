@@ -91,6 +91,7 @@ mod proto {
     define_test! {damage_efficiency}
     define_test! {fixes}
     define_test! {flip_damage}
+    define_test! {frame_rate}
     define_test! {gamma_control}
     define_test! {keymap}
     define_test! {icc}

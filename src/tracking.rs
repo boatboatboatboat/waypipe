@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
+use std::time::Instant;
 
 /** Structure storing information for a specific Wayland object */
 pub struct WpObject {
@@ -1546,6 +1547,12 @@ pub fn process_way_msg(
             opcode,
             length
         );
+        if is_req && !from_channel && !is_server_object(object_id) {
+            /* The server can't tell what this request on one of the program's objects (of an
+             * interface it doesn't know) does, so the next sync's answer must follow the
+             * compositor's (the content set, below) */
+            glob.local_frames.content_only = false;
+        }
         return proc_unknown_way_msg(msg, dst, transl);
     };
 
@@ -1559,6 +1566,10 @@ pub fn process_way_msg(
             "Method out of range: {}#{}, opcode {}",
             INTERFACE_TABLE[obj.obj_type as usize].name, object_id, opcode
         );
+        if is_req && !from_channel {
+            /* As for an unknown object, above */
+            glob.local_frames.content_only = false;
+        }
         return proc_unknown_way_msg(msg, dst, transl);
     }
 
@@ -1584,7 +1595,97 @@ pub fn process_way_msg(
 
     let remaining_space = (dst.len(), MAX_OUTGOING_FDS - outgoing_fds);
 
+    if is_req && !from_channel && glob.opts.frame_rate > 0 {
+        let frames = &glob.local_frames;
+        let content = if matches!(
+            (obj.obj_type, mod_opcode),
+            (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_COMMIT)
+        ) {
+            /* Only a commit keeping a buffer on a surface already showing one, a new buffer or
+             * the same (as with a commit adding only a frame callback): a first commit, or one
+             * unmapping the surface, has the compositor send events the program may wait for
+             * (a configure, wl_surface.enter) */
+            frames.shown.contains(&object_id)
+                && matches!(obj.extra,
+                    WpExtra::WlSurface(ref x) if x.attached_buffer_id.is_some())
+        } else {
+            matches!(
+                (obj.obj_type, mod_opcode),
+                (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_ATTACH)
+                | (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_DAMAGE)
+                | (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_DAMAGE_BUFFER)
+                | (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_FRAME)
+                | (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_SET_BUFFER_SCALE)
+                | (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_SET_BUFFER_TRANSFORM)
+                | (WaylandInterface::WpViewport, OPCODE_WP_VIEWPORT_SET_SOURCE)
+                | (WaylandInterface::WpViewport, OPCODE_WP_VIEWPORT_SET_DESTINATION)
+                | (WaylandInterface::XdgToplevel, OPCODE_XDG_TOPLEVEL_SET_TITLE)
+                /* Its events come once the frame is shown, whatever syncs follow */
+                | (WaylandInterface::WpPresentation, OPCODE_WP_PRESENTATION_FEEDBACK)
+                /* EGL replaces the buffers of its swap chain with these */
+                | (WaylandInterface::WlBuffer, OPCODE_WL_BUFFER_DESTROY)
+                | (WaylandInterface::ZwpLinuxDmabufV1, OPCODE_ZWP_LINUX_DMABUF_V1_CREATE_PARAMS)
+                | (WaylandInterface::ZwpLinuxBufferParamsV1, OPCODE_ZWP_LINUX_BUFFER_PARAMS_V1_ADD)
+                | (
+                    WaylandInterface::ZwpLinuxBufferParamsV1,
+                    OPCODE_ZWP_LINUX_BUFFER_PARAMS_V1_CREATE_IMMED
+                )
+                | (
+                    WaylandInterface::ZwpLinuxBufferParamsV1,
+                    OPCODE_ZWP_LINUX_BUFFER_PARAMS_V1_DESTROY
+                )
+                | (WaylandInterface::WlDisplay, OPCODE_WL_DISPLAY_SYNC)
+            )
+        };
+        /* A pong answers the compositor's ping, which may come many times a second while the
+         * pointer moves: no event replies to it and it changes nothing the program reads back,
+         * so the next sync is answered as if it had not come */
+        let pong = matches!(
+            (obj.obj_type, mod_opcode),
+            (WaylandInterface::XdgWmBase, OPCODE_XDG_WM_BASE_PONG)
+        );
+        if !content && !pong {
+            glob.local_frames.content_only = false;
+        } else if content
+            && !matches!(
+                (obj.obj_type, mod_opcode),
+                (WaylandInterface::WlDisplay, OPCODE_WL_DISPLAY_SYNC)
+            )
+        {
+            glob.local_frames.new_contents = true;
+        }
+    }
+
     match (obj.obj_type, mod_opcode) {
+        (WaylandInterface::WlDisplay, OPCODE_WL_DISPLAY_SYNC)
+            if !from_channel && glob.opts.frame_rate > 0 =>
+        {
+            /* A sync after requests that only updated surface contents (as EGL sends after each
+             * frame, to throttle) is answered here once those commits are captured
+             * (mainloop::answer_local_frames), rather than after a round trip to the compositor.
+             * As with frame callbacks, the request still goes to the compositor, whose done
+             * event is then dropped. */
+            check_space!(msg.len(), 0, remaining_space);
+            let callback = parse_req_wl_display_sync(msg)?;
+            copy_msg(msg, dst);
+            insert_new_object(
+                &mut glob.objects,
+                callback,
+                WpObject {
+                    obj_type: WaylandInterface::WlCallback,
+                    extra: WpExtra::None,
+                },
+            )?;
+            let frames = &mut glob.local_frames;
+            if frames.content_only && frames.new_contents && frames.remote_syncs.is_empty() {
+                frames.sync_due.push(callback);
+            } else {
+                frames.remote_syncs.insert(callback);
+            }
+            frames.content_only = true;
+            frames.new_contents = false;
+            Ok(ProcMsg::Done)
+        }
         (WaylandInterface::WlDisplay, OPCODE_WL_DISPLAY_DELETE_ID) => {
             check_space!(msg.len(), 0, remaining_space);
 
@@ -1598,6 +1699,9 @@ pub fn process_way_msg(
             } else {
                 debug!("Deleted untracked object");
             }
+            /* The program may reuse the id once it gets this event, so nothing answered later
+             * may name it */
+            glob.local_frames.forget(object_id);
 
             copy_msg(msg, dst);
 
@@ -1620,9 +1724,41 @@ pub fn process_way_msg(
             copy_msg(msg, dst);
             Ok(ProcMsg::Done)
         }
+        (WaylandInterface::WlBuffer, OPCODE_WL_BUFFER_RELEASE)
+            if from_channel && glob.local_frames.local_buffers.contains(&object_id) =>
+        {
+            /* The server released this buffer once its commit was captured
+             * (mainloop::answer_local_frames) */
+            Ok(ProcMsg::Done)
+        }
         (WaylandInterface::WlCallback, OPCODE_WL_CALLBACK_DONE) => {
             check_space!(msg.len(), 0, remaining_space);
-            copy_msg(msg, dst);
+            let frames = &mut glob.local_frames;
+            frames.remote_syncs.remove(&object_id);
+            if let Some((_, answered_at)) = frames.answered.remove(&object_id) {
+                frames.answer_returned(answered_at, Instant::now());
+            } else {
+                /* A callback the compositor answers before the server does is passed on now,
+                 * which keeps the program's syncs answered in order, and is not answered again.
+                 * A frame callback's time is given in the server's clock, as its other frame
+                 * callbacks' are. */
+                let pending_frame = frames
+                    .requested
+                    .iter()
+                    .chain(frames.due.iter())
+                    .any(|&(_, callback)| callback == object_id);
+                frames
+                    .requested
+                    .retain(|&(_, callback)| callback != object_id);
+                frames.due.retain(|&(_, callback)| callback != object_id);
+                frames.sync_due.retain(|&callback| callback != object_id);
+                if pending_frame {
+                    let time_ms = frames.callback_time(Instant::now());
+                    write_evt_wl_callback_done(dst, object_id, time_ms);
+                } else {
+                    copy_msg(msg, dst);
+                }
+            }
             /* This object has a destructor event, and no methods, so
              * it is considered deleted immediately on receipt of the message */
             glob.objects.remove(&object_id);
@@ -1860,6 +1996,28 @@ pub fn process_way_msg(
             }
             Ok(ProcMsg::Done)
         }
+        (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_FRAME)
+            if !from_channel && glob.opts.frame_rate > 0 =>
+        {
+            /* The server answers this callback's done event itself once the surface commits
+             * (mainloop::answer_local_frames). The request still goes to the compositor, which
+             * needs the program's object ids without gaps; its done event is then dropped, and
+             * its delete_id passed on, so the program reuses the id only once the compositor has
+             * released it. */
+            check_space!(msg.len(), 0, remaining_space);
+            let callback = parse_req_wl_surface_frame(msg)?;
+            copy_msg(msg, dst);
+            insert_new_object(
+                &mut glob.objects,
+                callback,
+                WpObject {
+                    obj_type: WaylandInterface::WlCallback,
+                    extra: WpExtra::None,
+                },
+            )?;
+            glob.local_frames.requested.push((object_id, callback));
+            Ok(ProcMsg::Done)
+        }
         (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_ATTACH) => {
             check_space!(msg.len(), 0, remaining_space);
 
@@ -1877,6 +2035,15 @@ pub fn process_way_msg(
                 }
             } else {
                 return Err(tag!("Attaching to nonexistant object"));
+            }
+            if !from_channel && glob.opts.frame_rate > 0 {
+                /* The server releases this buffer itself once its commit is captured */
+                let frames = &mut glob.local_frames;
+                frames.attached.retain(|&(surface, _)| surface != object_id);
+                if buf_id != ObjId(0) {
+                    frames.attached.push((object_id, buf_id));
+                    frames.local_buffers.insert(buf_id);
+                }
             }
 
             copy_msg(msg, dst);
@@ -1985,6 +2152,32 @@ pub fn process_way_msg(
             check_space!(msg.len(), 0, remaining_space);
 
             let () = parse_req_wl_surface_commit(msg)?;
+            if !from_channel && glob.opts.frame_rate > 0 {
+                let has_buffer = matches!(obj.extra,
+                    WpExtra::WlSurface(ref x) if x.attached_buffer_id.is_some());
+                let frames = &mut glob.local_frames;
+                if has_buffer {
+                    frames.shown.insert(object_id);
+                } else {
+                    frames.shown.remove(&object_id);
+                }
+                frames.requested.retain(|&(surface, callback)| {
+                    if surface == object_id {
+                        frames.due.push((surface, callback));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                frames.attached.retain(|&(surface, buffer)| {
+                    if surface == object_id {
+                        frames.release_due.push(buffer);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             let WpExtra::WlSurface(ref x) = obj.extra else {
                 return Err(tag!("Surface object has invalid extra type"));
             };

@@ -1716,7 +1716,7 @@ fn process_sfd_msg(
              * linear layout with the specified stride */
             // TODO: need method to prevent diff/fill ops from conflicting with video: is this even needed?
             let view_row_stride = Some(dmabuf_slice_get_first_stride(
-                msg[12..76].try_into().unwrap(),
+                msg[16..80].try_into().unwrap(),
             ));
 
             const H264: u32 = VideoFormat::H264 as u32;

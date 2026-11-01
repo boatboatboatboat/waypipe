@@ -115,6 +115,7 @@ handled_funcs = [
     ("xdg_toplevel_icon_manager_v1", "icon_size"),
     ("xdg_toplevel_icon_v1", "add_buffer"),
     ("xdg_wm_base", "get_xdg_surface"),
+    ("xdg_wm_base", "pong"),
     ("zwlr_data_control_device_v1", "data_offer"),
     ("zwlr_data_control_device_v1", "selection"),
     ("zwlr_data_control_device_v1", "set_selection"),

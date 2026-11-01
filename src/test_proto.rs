@@ -3340,6 +3340,7 @@ fn proto_frame_rate(info: TestInfo) -> TestResult {
             ObjId(7),
             ObjId(8),
         );
+        let xdg_wm_base = ObjId(9);
         let is_done = |cb: ObjId| move |m: &[u8]| callback_done(m).is_some_and(|(c, _)| c == cb);
         let dones = |msgs: &[Vec<u8>], cb: ObjId| msgs.iter().filter(|m| is_done(cb)(m)).count();
 
@@ -3349,10 +3350,12 @@ fn proto_frame_rate(info: TestInfo) -> TestResult {
         ctx.comp_write_passthrough(build_msgs(|dst| {
             write_evt_wl_registry_global(dst, registry, 1, WL_SHM, 2);
             write_evt_wl_registry_global(dst, registry, 2, WL_COMPOSITOR, 6);
+            write_evt_wl_registry_global(dst, registry, 3, XDG_WM_BASE, 6);
         }));
         ctx.prog_write_passthrough(build_msgs(|dst| {
             write_req_wl_registry_bind(dst, registry, 1, WL_SHM, 2, shm);
             write_req_wl_registry_bind(dst, registry, 2, WL_COMPOSITOR, 6, comp);
+            write_req_wl_registry_bind(dst, registry, 3, XDG_WM_BASE, 6, xdg_wm_base);
             write_req_wl_compositor_create_surface(dst, comp, surface);
         }));
 
@@ -3556,6 +3559,28 @@ fn proto_frame_rate(info: TestInfo) -> TestResult {
         ctx.prog_wait_for(&mut got, &is_done(cb12));
         ctx.prog_wait_for(&mut got, &is_done(cb11));
         answer(&mut ctx, &[cb11, cb12]);
+
+        /* A pong, before the new contents or after them, leaves the sync answered here; a sync
+         * after only a pong goes to the compositor */
+        let pong =
+            |serial: u32| build_msgs(|dst| write_req_xdg_wm_base_pong(dst, xdg_wm_base, serial));
+        for (pong_first, cb, sync) in [(true, ObjId(44), ObjId(45)), (false, ObjId(46), ObjId(47))]
+        {
+            let mut got = Vec::new();
+            let mut msgs = if pong_first { pong(1) } else { Vec::new() };
+            msgs.extend_from_slice(&new_frame(cb));
+            if !pong_first {
+                msgs.extend_from_slice(&pong(2));
+            }
+            msgs.extend_from_slice(&build_msgs(|dst| {
+                write_req_wl_display_sync(dst, display, sync)
+            }));
+            ctx.prog_write_replies(&msgs, &[], &mut got);
+            ctx.prog_wait_for(&mut got, &is_done(sync));
+            ctx.prog_wait_for(&mut got, &is_done(cb));
+            answer(&mut ctx, &[cb, sync]);
+        }
+        sync_after(&mut ctx, pong(3), ObjId(48));
 
         /* A sync answered here and left unanswered by the compositor past the bound holds the
          * next sync answered here, though not the surface's frame callbacks */

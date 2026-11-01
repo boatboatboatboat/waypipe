@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
+use std::time::Instant;
 
 /** Structure storing information for a specific Wayland object */
 pub struct WpObject {
@@ -1598,6 +1599,9 @@ pub fn process_way_msg(
             } else {
                 debug!("Deleted untracked object");
             }
+            /* The program may reuse the id once it gets this event, so nothing answered later
+             * may name it */
+            glob.local_frames.forget(object_id);
 
             copy_msg(msg, dst);
 
@@ -1620,9 +1624,67 @@ pub fn process_way_msg(
             copy_msg(msg, dst);
             Ok(ProcMsg::Done)
         }
+        (WaylandInterface::WlBuffer, OPCODE_WL_BUFFER_RELEASE)
+            if from_channel && glob.local_frames.released_here.contains_key(&object_id) =>
+        {
+            /* The server released this buffer once a newer commit replaced it
+             * (mainloop::answer_local_frames) */
+            let released = &mut glob.local_frames.released_here;
+            let count = released.get_mut(&object_id).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                released.remove(&object_id);
+            }
+            Ok(ProcMsg::Done)
+        }
+        (WaylandInterface::WlBuffer, OPCODE_WL_BUFFER_RELEASE)
+            if from_channel && glob.opts.frame_rate > 0 =>
+        {
+            /* The compositor gave this buffer back itself, so the server neither sends a release
+             * it has queued nor sends one when a newer commit replaces the buffer */
+            check_space!(msg.len(), 0, remaining_space);
+            let frames = &mut glob.local_frames;
+            frames.showing.retain(|_, &mut buffer| buffer != object_id);
+            frames.release_due.retain(|&buffer| buffer != object_id);
+            copy_msg(msg, dst);
+            Ok(ProcMsg::Done)
+        }
+        (WaylandInterface::WlBuffer, OPCODE_WL_BUFFER_RELEASE)
+            if !from_channel && glob.on_display_side =>
+        {
+            check_space!(msg.len(), 0, remaining_space);
+            if let WpExtra::WlBuffer(ref buf_data) = obj.extra {
+                glob.compositor_holds
+                    .remove(&buf_data.sfd.borrow().remote_id);
+            }
+            copy_msg(msg, dst);
+            Ok(ProcMsg::Done)
+        }
         (WaylandInterface::WlCallback, OPCODE_WL_CALLBACK_DONE) => {
             check_space!(msg.len(), 0, remaining_space);
-            copy_msg(msg, dst);
+            let frames = &mut glob.local_frames;
+            if let Some((_, answered_at)) = frames.answered.remove(&object_id) {
+                frames.answer_returned(answered_at, Instant::now());
+            } else {
+                /* A callback the compositor answers before the server does is passed on now,
+                 * and not answered again. A frame callback's time is given in the server's
+                 * clock, as its other frame callbacks' are. */
+                let pending_frame = frames
+                    .requested
+                    .iter()
+                    .chain(frames.due.iter())
+                    .any(|&(_, callback)| callback == object_id);
+                frames
+                    .requested
+                    .retain(|&(_, callback)| callback != object_id);
+                frames.due.retain(|&(_, callback)| callback != object_id);
+                if pending_frame {
+                    let time_ms = frames.callback_time(Instant::now());
+                    write_evt_wl_callback_done(dst, object_id, time_ms);
+                } else {
+                    copy_msg(msg, dst);
+                }
+            }
             /* This object has a destructor event, and no methods, so
              * it is considered deleted immediately on receipt of the message */
             glob.objects.remove(&object_id);
@@ -1860,6 +1922,28 @@ pub fn process_way_msg(
             }
             Ok(ProcMsg::Done)
         }
+        (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_FRAME)
+            if !from_channel && glob.opts.frame_rate > 0 =>
+        {
+            /* The server answers this callback's done event itself once the surface commits
+             * (mainloop::answer_local_frames). The request still goes to the compositor, which
+             * needs the program's object ids without gaps; its done event is then dropped, and
+             * its delete_id passed on, so the program reuses the id only once the compositor has
+             * released it. */
+            check_space!(msg.len(), 0, remaining_space);
+            let callback = parse_req_wl_surface_frame(msg)?;
+            copy_msg(msg, dst);
+            insert_new_object(
+                &mut glob.objects,
+                callback,
+                WpObject {
+                    obj_type: WaylandInterface::WlCallback,
+                    extra: WpExtra::None,
+                },
+            )?;
+            glob.local_frames.requested.push((object_id, callback));
+            Ok(ProcMsg::Done)
+        }
         (WaylandInterface::WlSurface, OPCODE_WL_SURFACE_ATTACH) => {
             check_space!(msg.len(), 0, remaining_space);
 
@@ -1877,6 +1961,13 @@ pub fn process_way_msg(
                 }
             } else {
                 return Err(tag!("Attaching to nonexistant object"));
+            }
+            if !from_channel && glob.opts.frame_rate > 0 {
+                let frames = &mut glob.local_frames;
+                frames.attached.retain(|&(surface, _)| surface != object_id);
+                if buf_id != ObjId(0) {
+                    frames.attached.push((object_id, buf_id));
+                }
             }
 
             copy_msg(msg, dst);
@@ -1985,6 +2076,36 @@ pub fn process_way_msg(
             check_space!(msg.len(), 0, remaining_space);
 
             let () = parse_req_wl_surface_commit(msg)?;
+            if !from_channel && glob.opts.frame_rate > 0 {
+                let frames = &mut glob.local_frames;
+                frames.requested.retain(|&(surface, callback)| {
+                    if surface == object_id {
+                        frames.due.push((surface, callback));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                /* The buffer this commit replaces is free for the program once this commit is
+                 * captured. The compositor still shows the new one, which stays with it. A buffer
+                 * with an explicit-sync release point is left to that protocol. */
+                let explicit = matches!(obj.extra,
+                    WpExtra::WlSurface(ref x) if x.release_pt.is_some());
+                let attached = frames.attached.iter().find(|&&(s, _)| s == object_id);
+                if let Some(&(_, buffer)) = attached {
+                    let replaced = if explicit {
+                        frames.showing.remove(&object_id)
+                    } else {
+                        frames.showing.insert(object_id, buffer)
+                    };
+                    if let Some(old) = replaced.filter(|&old| old != buffer) {
+                        frames.release_due.push(old);
+                    }
+                } else if !has_buffer {
+                    frames.showing.remove(&object_id);
+                }
+                frames.attached.retain(|&(surface, _)| surface != object_id);
+            }
             let WpExtra::WlSurface(ref x) = obj.extra else {
                 return Err(tag!("Surface object has invalid extra type"));
             };
@@ -2043,9 +2164,14 @@ pub fn process_way_msg(
                     if let Some(buf) = glob.objects.get(&buf_id) {
                         if let WpExtra::WlBuffer(ref buf_data) = buf.extra {
                             let mut sfd = buf_data.sfd.borrow_mut();
+                            let remote_id = sfd.remote_id;
                             if let ShadowFdVariant::Dmabuf(ref mut y) = &mut sfd.data {
                                 dmabuf_post_apply_task_operations(y)?;
 
+                                /* An explicit-sync buffer gets no wl_buffer.release to wait for */
+                                if rel_pt.is_none() {
+                                    glob.compositor_holds.insert(remote_id);
+                                }
                                 if let Some((pt, timeline)) = acq_pt {
                                     y.acquires.push((pt, timeline));
                                 }

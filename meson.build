@@ -231,3 +231,9 @@ if scdoc.found()
         install_dir: '@0@/man1'.format(mandir),
     )
 endif
+
+install_data(
+    'waypipe-audio',
+    install_dir: get_option('bindir'),
+    install_mode: 'rwxr-xr-x',
+)

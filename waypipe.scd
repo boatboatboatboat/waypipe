@@ -95,6 +95,28 @@ compressible as images containing pictures.
 	Specify the path *R* to the drm device that this instance of waypipe should
 	use and (in server mode) notify connecting applications about.
 
+*--audio*
+	For ssh mode: carry the application's sound as well. The remote end makes a
+	null sink for the run, points the application at it with _PULSE_SINK_, and
+	sends its sound as Opus in RTP over UDP to the machine in _SSH_CONNECTION_,
+	beside Waypipe's stream; this end plays it. With *--frame-rate*, the
+	receiver's jitter buffer is steered toward the frame time (see
+	*--frame-time-file*), down to half the measured round trip plus a margin
+	learned from late packets; no frame is delayed. Runs *waypipe-audio*, which
+	needs GStreamer's Python bindings on both ends and _pactl_ on the remote
+	one; if any of that fails, a message says so and the application runs with
+	no sound. The remote Waypipe must have this option too. The sound goes to
+	the IPv4 address in _SSH_CONNECTION_, which behind a jump host or NAT names
+	that hop, so the sound doesn't arrive there.
+
+*--audio-port P*
+	For client and server modes: as *--audio*, for each end started separately.
+	Ports *P* to *P* + 2 carry it. Give both ends the same value.
+
+*--frame-time-file PATH*
+	For server mode with *--frame-rate*: keep in _PATH_ the recent median time,
+	in milliseconds, from a frame's commit to the compositor's answer arriving.
+
 *--frame-rate F*
 	For server or ssh mode: answer an application's frame callbacks in the
 	server, at most *F* times a second and once the previous frame has been

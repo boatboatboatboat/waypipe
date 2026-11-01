@@ -1764,6 +1764,7 @@ pub fn process_way_msg(
             check_space!(msg.len(), 0, remaining_space);
             let frames = &mut glob.local_frames;
             frames.remote_syncs.remove(&object_id);
+            frames.frame_shown(object_id, Instant::now());
             if let Some((_, answered_at)) = frames.answered.remove(&object_id) {
                 frames.answer_returned(answered_at, Instant::now());
             } else {
@@ -2188,9 +2189,13 @@ pub fn process_way_msg(
                 } else {
                     frames.shown.remove(&object_id);
                 }
+                let now = glob.opts.frame_time_file.as_ref().map(|_| Instant::now());
                 frames.requested.retain(|&(surface, callback)| {
                     if surface == object_id {
                         frames.due.push((surface, callback));
+                        if let Some(now) = now {
+                            frames.committed_at.insert(callback, now);
+                        }
                         false
                     } else {
                         true

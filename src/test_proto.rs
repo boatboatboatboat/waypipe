@@ -735,6 +735,8 @@ struct WaypipeOptions<'a> {
     compression: Compression,
     /** --frame-rate, for the program-side instance; 0 leaves it out */
     frame_rate: u32,
+    /** --frame-time-file, for the program-side instance */
+    frame_time_file: Option<&'a str>,
 }
 
 /** Construct the command to run a Waypipe connection handling process, with specified options. */
@@ -773,6 +775,9 @@ fn build_arguments(waypipe_bin: &OsStr, opts: &WaypipeOptions, is_client: bool) 
     }
     if opts.frame_rate > 0 && !is_client {
         v.push(format!("--frame-rate={}", opts.frame_rate));
+    }
+    if let (Some(path), false) = (opts.frame_time_file, is_client) {
+        v.push(format!("--frame-time-file={}", path));
     }
 
     if is_client {
@@ -879,6 +884,7 @@ fn run_protocol_test_with_drm_node(
     let options = WaypipeOptions {
         wire_version: None,
         frame_rate: 0,
+        frame_time_file: None,
         drm_node: Some(device.id),
         device_type: device.device_type,
         compression: Compression::None,
@@ -896,6 +902,7 @@ fn run_protocol_test(
     let options = WaypipeOptions {
         wire_version: None,
         frame_rate: 0,
+        frame_time_file: None,
         drm_node: None,
         device_type: RenderDeviceType::Vulkan,
         compression: Compression::None,
@@ -1098,6 +1105,7 @@ fn proto_base_wire(info: TestInfo) -> TestResult {
     let opts = WaypipeOptions {
         wire_version: Some(MIN_PROTOCOL_VERSION),
         frame_rate: 0,
+        frame_time_file: None,
         drm_node: None,
         device_type: RenderDeviceType::Vulkan,
         title_prefix: "",
@@ -3154,6 +3162,7 @@ fn proto_dmavid(
         device_type: device.device_type,
         wire_version: None,
         frame_rate: 0,
+        frame_time_file: None,
     };
     println!(
         "\nTrying combination: video={:?}, try_hw_dec={}, try_hw_enc={}",
@@ -3214,6 +3223,75 @@ fn callback_done(msg: &[u8]) -> Option<(ObjId, u32)> {
     Some((obj, parse_evt_wl_callback_done(msg).ok()?))
 }
 
+/** With --frame-time-file, the server reports the time from a commit to the compositor's answer: a
+ * delay put between the two shows in the file, and no answer leaves no file. */
+fn proto_frame_time(info: TestInfo) -> TestResult {
+    let delay = std::time::Duration::from_millis(100);
+    let path = std::env::temp_dir().join(format!("waypipe-frame-time-{}", std::process::id()));
+    drop(std::fs::remove_file(&path));
+    let path_str = path.to_str().unwrap().to_string();
+    let opts = WaypipeOptions {
+        wire_version: None,
+        drm_node: None,
+        device_type: RenderDeviceType::Vulkan,
+        video: VideoSetting::default(),
+        title_prefix: "",
+        compression: Compression::None,
+        frame_rate: 1000,
+        frame_time_file: Some(&path_str),
+    };
+    run_protocol_test_with_opts(&info, &opts, &opts, &|mut ctx: ProtocolTestContext| {
+        let (display, registry, comp, surface, cb) =
+            (ObjId(1), ObjId(2), ObjId(3), ObjId(4), ObjId(5));
+        ctx.prog_write_passthrough(build_msgs(|dst| {
+            write_req_wl_display_get_registry(dst, display, registry);
+        }));
+        ctx.comp_write_passthrough(build_msgs(|dst| {
+            write_evt_wl_registry_global(dst, registry, 1, WL_COMPOSITOR, 6);
+        }));
+        ctx.prog_write_passthrough(build_msgs(|dst| {
+            write_req_wl_registry_bind(dst, registry, 1, WL_COMPOSITOR, 6, comp);
+            write_req_wl_compositor_create_surface(dst, comp, surface);
+        }));
+        let mut got = Vec::new();
+        ctx.prog_write_replies(
+            &build_msgs(|dst| {
+                write_req_wl_surface_frame(dst, surface, cb);
+                write_req_wl_surface_commit(dst, surface);
+            }),
+            &[],
+            &mut got,
+        );
+        assert!(!path.exists(), "a frame time before any answer");
+        std::thread::sleep(delay);
+        /* The done event stops here; the delete_id after it comes through, so the wait ends */
+        ctx.comp_write(
+            &build_msgs(|dst| {
+                write_evt_wl_callback_done(dst, cb, 1);
+                write_evt_wl_display_delete_id(dst, display, cb.0);
+            }),
+            &[],
+        )
+        .unwrap();
+        /* The file is written on the main loop's next pass */
+        ctx.prog_write_replies(
+            &build_msgs(|dst| {
+                write_req_wl_surface_commit(dst, surface);
+            }),
+            &[],
+            &mut got,
+        );
+        let ms: u128 = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(ms >= delay.as_millis(), "reported {} ms", ms);
+    })?;
+    drop(std::fs::remove_file(&path));
+    Ok(StatusOk::Pass)
+}
+
 /** Test that with --frame-rate a buffer the compositor may be showing stays with it: the program
  * gets no release for the buffer a surface last committed, gets one once a newer commit replaces
  * it, without the compositor's own being passed on as well, and gets the compositor's release of
@@ -3227,6 +3305,7 @@ fn proto_frame_rate_release(info: TestInfo) -> TestResult {
         title_prefix: "",
         compression: Compression::None,
         frame_rate: 1000,
+        frame_time_file: None,
     };
     run_protocol_test_with_opts(&info, &opts, &opts, &|mut ctx: ProtocolTestContext| {
         let (display, registry, shm, comp, surface, pool, first, second) = (
@@ -3328,6 +3407,7 @@ fn proto_frame_rate(info: TestInfo) -> TestResult {
         title_prefix: "",
         compression: Compression::None,
         frame_rate: 1000,
+        frame_time_file: None,
     };
     run_protocol_test_with_opts(&info, &opts, &opts, &|mut ctx: ProtocolTestContext| {
         let (display, registry, shm, comp, surface, pool, buffer, surface2) = (
@@ -5015,6 +5095,7 @@ fn proto_title_prefix(info: TestInfo) -> TestResult {
         let options = WaypipeOptions {
             wire_version: None,
             frame_rate: 0,
+            frame_time_file: None,
             drm_node: None,
             device_type: RenderDeviceType::Vulkan,
             video: VideoSetting::default(),
@@ -5879,6 +5960,7 @@ fn main() -> ExitCode {
     register_single(t, &f, "flip_damage", proto_flip_damage);
     register_single(t, &f, "frame_rate", proto_frame_rate);
     register_single(t, &f, "frame_rate_release", proto_frame_rate_release);
+    register_single(t, &f, "frame_time", proto_frame_time);
     register_single(t, &f, "gamma_control", proto_gamma_control);
     register_single(t, &f, "keymap", proto_keymap);
     register_single(t, &f, "icc", proto_icc);

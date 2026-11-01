@@ -337,6 +337,10 @@ fn build_connection_command<'a>(
         args.push(OsStr::new("--frame-rate"));
         args.push(frame_rate_str);
     }
+    if let (Some(p), false) = (&options.frame_time_file, client) {
+        args.push(OsStr::new("--frame-time-file"));
+        args.push(p.as_os_str());
+    }
     if let Some(d) = &options.drm_node {
         assert!(!client);
         args.push(OsStr::new("--drm-node"));
@@ -2161,6 +2165,17 @@ fn main() -> Result<ExitCode, String> {
                 .default_value("0"),
         )
         .arg(
+            Arg::new("frame-time-file")
+                .long("frame-time-file")
+                .value_name("path")
+                .help(
+                    "server, with --frame-rate: Keep in this file the recent median time, in \
+                     milliseconds, from a frame's commit to the compositor's answer returning, \
+                     so another program can line up with how late frames show",
+                )
+                .value_parser(value_parser!(PathBuf)),
+        )
+        .arg(
             Arg::new("title-prefix")
                 .long("title-prefix")
                 .value_name("str")
@@ -2410,6 +2425,7 @@ fn main() -> Result<ExitCode, String> {
         video,
         threads: *threads,
         frame_rate,
+        frame_time_file: matches.get_one::<PathBuf>("frame-time-file").cloned(),
         title_prefix: (*title_prefix).clone(),
         drm_node: drm_node.cloned(),
         test_skip_vulkan,

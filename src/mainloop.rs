@@ -223,6 +223,103 @@ pub struct LocalFrames {
      * first, when it arrived and how long after the server's answer; shortest_round_trip()
      * reads those of the last ROUND_TRIP_WINDOW */
     pub round_trips: VecDeque<(Instant, Duration)>,
+    /** When each frame callback's surface committed, until the compositor answers it */
+    pub committed_at: BTreeMap<ObjId, Instant>,
+    /** For each frame the compositor has answered, oldest first, when the answer arrived and how
+     * long after the commit; Options::frame_time_file reports those of the last FRAME_TIME_WINDOW */
+    pub frame_times: VecDeque<(Instant, Duration)>,
+    /** When Options::frame_time_file was last written */
+    pub frame_time_written: Option<Instant>,
+}
+
+/** How far back the reported frame time looks: long enough to smooth single frames, short enough
+ * to follow a change of the link within seconds */
+const FRAME_TIME_WINDOW: Duration = Duration::from_secs(3);
+/** How often the reported frame time is rewritten */
+const FRAME_TIME_INTERVAL: Duration = Duration::from_secs(1);
+
+/** The median of these durations; None when there are none */
+fn median_duration(times: impl Iterator<Item = Duration>) -> Option<Duration> {
+    let mut v: Vec<Duration> = times.collect();
+    v.sort_unstable();
+    v.get(v.len() / 2).copied()
+}
+
+#[test]
+fn test_median_duration() {
+    let ms = Duration::from_millis;
+    assert_eq!(median_duration([].into_iter()), None);
+    assert_eq!(median_duration([ms(5)].into_iter()), Some(ms(5)));
+    assert_eq!(
+        median_duration([ms(9), ms(1), ms(5)].into_iter()),
+        Some(ms(5))
+    );
+    /* One slow frame doesn't move it */
+    assert_eq!(
+        median_duration([ms(5), ms(5), ms(900)].into_iter()),
+        Some(ms(5))
+    );
+}
+
+/** A callback id the compositor releases unanswered and the program reuses gives no sample */
+#[test]
+fn test_forget_drops_commit_time() {
+    let mut frames = LocalFrames {
+        requested: Vec::new(),
+        due: Vec::new(),
+        answered: BTreeMap::new(),
+        attached: Vec::new(),
+        shown: BTreeSet::new(),
+        release_due: Vec::new(),
+        showing: BTreeMap::new(),
+        released_here: BTreeMap::new(),
+        content_only: true,
+        new_contents: false,
+        sync_due: Vec::new(),
+        remote_syncs: BTreeSet::new(),
+        last_answer: None,
+        epoch: Instant::now(),
+        round_trips: VecDeque::new(),
+        committed_at: BTreeMap::new(),
+        frame_times: VecDeque::new(),
+        frame_time_written: None,
+    };
+    let (released, kept) = (ObjId(20), ObjId(21));
+    let now = Instant::now();
+    frames.committed_at.insert(released, now);
+    frames.committed_at.insert(kept, now);
+    frames.forget(released);
+    frames.frame_shown(released, now);
+    assert!(frames.frame_times.is_empty());
+    frames.frame_shown(kept, now);
+    assert_eq!(frames.frame_times.len(), 1);
+}
+
+/** Write the median frame time to Options::frame_time_file, replacing it whole, at most once per
+ * FRAME_TIME_INTERVAL. A failure to write costs only the report, so it is logged and ignored. */
+fn report_frame_time(glob: &mut Globals) {
+    let Some(path) = &glob.opts.frame_time_file else {
+        return;
+    };
+    let frames = &mut glob.local_frames;
+    let now = Instant::now();
+    if frames
+        .frame_time_written
+        .is_some_and(|t| now.duration_since(t) < FRAME_TIME_INTERVAL)
+    {
+        return;
+    }
+    let Some(median) = median_duration(frames.frame_times.iter().map(|&(_, d)| d)) else {
+        return;
+    };
+    frames.frame_time_written = Some(now);
+    let mut tmp = path.clone().into_os_string();
+    tmp.push(".tmp");
+    let res = std::fs::write(&tmp, format!("{}\n", median.as_millis()))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = res {
+        debug!("Failed to write frame time to {:?}: {}", path, e);
+    }
 }
 
 /** How long a frame callback answered here may wait for the compositor's own answer before the
@@ -315,6 +412,7 @@ impl LocalFrames {
         self.released_here.remove(&id);
         self.sync_due.retain(|&c| c != id);
         self.remote_syncs.remove(&id);
+        self.committed_at.remove(&id);
     }
 
     /** Whether a frame callback of `surface` answered here has waited longer than
@@ -323,6 +421,22 @@ impl LocalFrames {
         self.answered
             .values()
             .any(|&(s, t)| s == Some(surface) && now.duration_since(t) > LOCAL_FRAME_HOLD)
+    }
+
+    /** Record that the compositor answered `callback` at `now`, if its surface's commit was
+     * timed; samples older than FRAME_TIME_WINDOW are dropped here */
+    pub fn frame_shown(&mut self, callback: ObjId, now: Instant) {
+        if let Some(committed) = self.committed_at.remove(&callback) {
+            self.frame_times
+                .push_back((now, now.saturating_duration_since(committed)));
+        }
+        while self
+            .frame_times
+            .front()
+            .is_some_and(|&(t, _)| now.duration_since(t) > FRAME_TIME_WINDOW)
+        {
+            self.frame_times.pop_front();
+        }
     }
 
     /** Record that the compositor answered, at `now`, a callback the server answered at
@@ -5051,6 +5165,7 @@ fn loop_inner<'a>(
     let mut vulkan_wait_pipe_r: Option<OwnedFd> = None;
 
     while from_chan.state != DirectionState::Off || from_way.state != DirectionState::Off {
+        report_frame_time(glob);
         let local_frames_wait = answer_local_frames(glob, from_chan, from_way);
         if let Some((rid, until)) = from_chan.held_for {
             if !glob.compositor_holds.contains(&rid) {
@@ -6017,6 +6132,9 @@ pub struct Options {
     /** If nonzero, the server answers the program's frame callbacks itself, at most this many
      * times a second, instead of waiting for the compositor's answers */
     pub frame_rate: u32,
+    /** Server, with frame_rate: a file to hold, in decimal milliseconds, the recent median time
+     * from a frame's commit to the compositor's answer arriving back here */
+    pub frame_time_file: Option<PathBuf>,
     /** A valid utf8 string with which to prefix xdg toplevel titles */
     pub title_prefix: String,
     /* If true, filter out protocols and messages using dmabufs */
@@ -6129,6 +6247,9 @@ pub fn main_interface_loop(
             last_answer: None,
             epoch: Instant::now(),
             round_trips: VecDeque::new(),
+            committed_at: BTreeMap::new(),
+            frame_times: VecDeque::new(),
+            frame_time_written: None,
         },
         opts,
         wire_version: init_wire_version,

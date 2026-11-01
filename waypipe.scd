@@ -101,12 +101,16 @@ compressible as images containing pictures.
 	sent, and release a buffer once a newer commit to its surface is captured,
 	instead of waiting a round trip for the compositor's answers. The local side
 	writes a buffer's next contents only once the compositor releases it, or
-	after 100 ms. While a surface's oldest
-	frame callback answered in the server has waited for the compositor's answer
-	100 ms longer than the shortest recent round trip, its next callbacks wait
-	too, until the compositor's answers catch up. A surface whose frame
-	callback the compositor has held for over a second, as it does for a
-	hidden window, is left to the compositor until it answers. A buffer
+	after 100 ms. A _wl_display.sync_ that
+	follows one or more requests, all giving new contents to surfaces already
+	showing a buffer (as EGL sends after each frame), is answered in the server
+	too, once those commits are captured. While a surface's oldest frame
+	callback, or the oldest sync, answered in the server has waited for the
+	compositor's answer 100 ms longer than the shortest recent round trip, that
+	surface's next callbacks, or the next syncs, wait too, until the
+	compositor's answers catch up. A surface
+	whose frame callback the compositor has held for over a second, as it does
+	for a hidden window, is left to the compositor until it answers. A buffer
 	with an explicit-sync release point (_wp_linux_drm_syncobj_v1_) is released
 	by that protocol alone. The default, _0_, waits for the
 	compositor.

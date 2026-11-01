@@ -189,6 +189,9 @@ pub struct LocalFrames {
     pub answered: BTreeMap<ObjId, (Option<ObjId>, Instant)>,
     /** Buffers attached since their surface's last commit, as (surface, buffer) */
     pub attached: Vec<(ObjId, ObjId)>,
+    /** Surfaces whose last commit showed a buffer, whose next commit of a buffer the program
+     * can observe only through its frame callbacks and buffer releases */
+    pub shown: BTreeSet<ObjId>,
     /** The buffer each surface last committed, which the compositor still shows: it is released
      * to the program only once a newer commit replaces it, since the display side writes the
      * program's next contents into its copy of whichever buffer the program draws to */
@@ -199,6 +202,19 @@ pub struct LocalFrames {
     /** Per buffer, the releases the server sent whose counterparts from the compositor are still
      * to be dropped */
     pub released_here: BTreeMap<ObjId, u32>,
+    /** Whether every request since the program's last wl_display.sync only updated surface
+     * contents, so that the compositor answering a sync now would tell the program nothing it
+     * can observe */
+    pub content_only: bool,
+    /** Whether a request giving new contents came since the program's last wl_display.sync: a
+     * sync with none before it waits for the compositor's answer, as a loop of round trips
+     * waiting for a compositor event does */
+    pub new_contents: bool,
+    /** wl_display.sync callbacks answered here, once the commits before them are captured */
+    pub sync_due: Vec<ObjId>,
+    /** wl_display.sync callbacks the compositor answers, still unanswered; while any is, later
+     * syncs go to the compositor too, so that the program gets their answers in order */
+    pub remote_syncs: BTreeSet<ObjId>,
     /** When callbacks were last answered */
     pub last_answer: Option<Instant>,
     /** Base of the millisecond timestamps sent in wl_callback.done */
@@ -293,9 +309,12 @@ impl LocalFrames {
         self.answered
             .retain(|&c, &mut (s, _)| c != id && s != Some(id));
         self.attached.retain(|&(s, b)| s != id && b != id);
+        self.shown.remove(&id);
         self.release_due.retain(|&b| b != id);
         self.showing.retain(|&s, &mut b| s != id && b != id);
         self.released_here.remove(&id);
+        self.sync_due.retain(|&c| c != id);
+        self.remote_syncs.remove(&id);
     }
 
     /** Whether a frame callback of `surface` answered here has waited longer than
@@ -321,16 +340,16 @@ impl LocalFrames {
         }
     }
 
-    /** Whether the oldest frame callback of `surface` answered here has waited for the
-     * compositor's answer more than LOCAL_FRAME_QUEUE longer than the shortest recent round
-     * trip; never before a round trip has been seen */
-    fn behind(&self, surface: ObjId, now: Instant) -> bool {
+    /** Whether the oldest frame callback of `surface` answered here, or with None the oldest
+     * wl_display.sync, has waited for the compositor's answer more than LOCAL_FRAME_QUEUE longer
+     * than the shortest recent round trip; never before a round trip has been seen */
+    fn behind(&self, surface: Option<ObjId>, now: Instant) -> bool {
         let Some(shortest) = shortest_round_trip(&self.round_trips, now) else {
             return false;
         };
-        self.answered.values().any(|&(s, t)| {
-            s == Some(surface) && now.duration_since(t) > shortest + LOCAL_FRAME_QUEUE
-        })
+        self.answered
+            .values()
+            .any(|&(s, t)| s == surface && now.duration_since(t) > shortest + LOCAL_FRAME_QUEUE)
     }
 
     /** The millisecond timestamp for a wl_callback.done sent at `now` */
@@ -4602,7 +4621,7 @@ fn answer_local_frames(
     from_way: &FromWayland,
 ) -> Option<Duration> {
     let frames = &mut glob.local_frames;
-    if (frames.due.is_empty() && frames.release_due.is_empty())
+    if (frames.due.is_empty() && frames.release_due.is_empty() && frames.sync_due.is_empty())
         /* Committed buffers have been read once the work their commits started is done */
         || has_pending_compute_tasks(&from_way.output)
         /* Messages are only added to the Wayland-bound buffer once it has been flushed */
@@ -4622,8 +4641,22 @@ fn answer_local_frames(
         write_evt_wl_buffer_release(&mut dst, buffer);
         *frames.released_here.entry(buffer).or_insert(0) += 1;
     }
-
     let now = Instant::now();
+    /* A sync waits on no frame interval: the program paces itself by its frame callbacks. Syncs
+     * queued on the link wait, in order, for the compositor's answers to catch up. */
+    let n_sync = if frames.behind(None, now) {
+        0
+    } else {
+        std::cmp::min(
+            dst.len() / length_evt_wl_callback_done(),
+            frames.sync_due.len(),
+        )
+    };
+    for cb in frames.sync_due.drain(..n_sync) {
+        write_evt_wl_callback_done(&mut dst, cb, 0);
+        frames.answered.insert(cb, (None, now));
+    }
+
     let mut wait = None;
     if !frames.due.is_empty() {
         let next = frames
@@ -4645,7 +4678,7 @@ fn answer_local_frames(
             for (surface, cb) in std::mem::take(&mut frames.due) {
                 if dst.len() < length_evt_wl_callback_done()
                     || frames.held(surface, now)
-                    || frames.behind(surface, now)
+                    || frames.behind(Some(surface), now)
                 {
                     kept.push((surface, cb));
                     continue;
@@ -6085,9 +6118,14 @@ pub fn main_interface_loop(
             due: Vec::new(),
             answered: BTreeMap::new(),
             attached: Vec::new(),
+            shown: BTreeSet::new(),
             release_due: Vec::new(),
             showing: BTreeMap::new(),
             released_here: BTreeMap::new(),
+            content_only: true,
+            new_contents: false,
+            sync_due: Vec::new(),
+            remote_syncs: BTreeSet::new(),
             last_answer: None,
             epoch: Instant::now(),
             round_trips: VecDeque::new(),

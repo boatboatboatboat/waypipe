@@ -3315,10 +3315,10 @@ fn proto_frame_rate_release(info: TestInfo) -> TestResult {
     Ok(StatusOk::Pass)
 }
 
-/** Test that with --frame-rate the program-side instance answers frame callbacks itself; that a
- * callback the compositor answers first is passed on once, in the instance's clock; that a
- * released callback id is never answered; and that a surface whose callback the compositor holds
- * back is left to the compositor */
+/** Test that with --frame-rate the program-side instance answers frame callbacks, and syncs
+ * after only a surface's new contents, itself; that a callback the compositor answers first is
+ * passed on once, in the instance's clock; that a released callback id is never answered; and
+ * that a surface whose callback the compositor holds back is left to the compositor */
 fn proto_frame_rate(info: TestInfo) -> TestResult {
     let opts = WaypipeOptions {
         wire_version: None,
@@ -3369,12 +3369,14 @@ fn proto_frame_rate(info: TestInfo) -> TestResult {
 
         /* A frame callback is answered once its surface commits; the compositor's own answer is
          * then dropped, and its delete_id passed on */
-        let (cb1, cb2, cb3, cb4, cb5, cb8, cb9) = (
+        let (cb1, cb2, cb3, cb4, cb5, cb6, cb7, cb8, cb9) = (
             ObjId(20),
             ObjId(21),
             ObjId(22),
             ObjId(23),
             ObjId(24),
+            ObjId(25),
+            ObjId(26),
             ObjId(27),
             ObjId(28),
         );
@@ -3493,9 +3495,92 @@ fn proto_frame_rate(info: TestInfo) -> TestResult {
         assert!(dones(&got, cb_b) == 1);
         answer(&mut ctx, &[cb_b, cb_c]);
 
-        ctx.prog_write_passthrough(build_msgs(|dst| {
-            write_req_wl_compositor_create_surface(dst, comp, surface2);
+        /* A sync after anything but new contents for a shown surface, a surface's first commit
+         * included, is answered by the compositor; one after only new contents, here */
+        let sync_after = |ctx: &mut ProtocolTestContext, before: Vec<u8>, cb: ObjId| {
+            let mut msgs = before;
+            msgs.extend_from_slice(&build_msgs(|dst| {
+                write_req_wl_display_sync(dst, display, cb)
+            }));
+            let mut got = Vec::new();
+            ctx.prog_write_replies(&msgs, &[], &mut got);
+            let done = build_msgs(|dst| write_evt_wl_callback_done(dst, cb, 0));
+            let (rmsg, _) = ctx.comp_write(&done, &[]).unwrap();
+            assert!(dones(&got, cb) == 0 && rmsg.concat() == done);
+            ctx.comp_write_passthrough(build_msgs(|dst| {
+                write_evt_wl_display_delete_id(dst, display, cb.0);
+            }));
+        };
+        sync_after(
+            &mut ctx,
+            build_msgs(|dst| write_req_wl_compositor_create_surface(dst, comp, surface2)),
+            ObjId(30),
+        );
+        sync_after(
+            &mut ctx,
+            build_msgs(|dst| write_req_wl_surface_commit(dst, surface2)),
+            ObjId(31),
+        );
+        /* So is a sync with no request since the previous one, as in a loop of round trips
+         * waiting for a compositor event */
+        sync_after(&mut ctx, Vec::new(), ObjId(42));
+        /* And one after a request the server can't read, here on an object it doesn't track,
+         * though new contents came before it */
+        let mut unread =
+            build_msgs(|dst| write_req_wl_surface_damage_buffer(dst, surface, 0, 0, 1, 1));
+        unread.extend_from_slice(&60u32.to_le_bytes());
+        unread.extend_from_slice(&(8u32 << 16).to_le_bytes());
+        sync_after(&mut ctx, unread, ObjId(43));
+        let mut got = Vec::new();
+        let mut msgs = new_frame(cb6);
+        msgs.extend_from_slice(&build_msgs(|dst| {
+            write_req_wl_display_sync(dst, display, cb7)
         }));
+        ctx.prog_write_replies(&msgs, &[], &mut got);
+        ctx.prog_wait_for(&mut got, &is_done(cb7));
+        ctx.prog_wait_for(&mut got, &is_done(cb6));
+        answer(&mut ctx, &[cb6, cb7]);
+        /* So is one after a commit adding only a frame callback to a shown surface, its buffer
+         * kept, as Firefox sends between frames */
+        let (cb11, cb12) = (ObjId(32), ObjId(33));
+        let mut got = Vec::new();
+        ctx.prog_write_replies(
+            &build_msgs(|dst| {
+                write_req_wl_surface_frame(dst, surface, cb11);
+                write_req_wl_surface_commit(dst, surface);
+                write_req_wl_display_sync(dst, display, cb12);
+            }),
+            &[],
+            &mut got,
+        );
+        ctx.prog_wait_for(&mut got, &is_done(cb12));
+        ctx.prog_wait_for(&mut got, &is_done(cb11));
+        answer(&mut ctx, &[cb11, cb12]);
+
+        /* A sync answered here and left unanswered by the compositor past the bound holds the
+         * next sync answered here, though not the surface's frame callbacks */
+        let (cb_x, s1, cb_y, s2) = (ObjId(38), ObjId(39), ObjId(40), ObjId(41));
+        let mut got = Vec::new();
+        let mut msgs = new_frame(cb_x);
+        msgs.extend_from_slice(&build_msgs(|dst| {
+            write_req_wl_display_sync(dst, display, s1)
+        }));
+        ctx.prog_write_replies(&msgs, &[], &mut got);
+        ctx.prog_wait_for(&mut got, &is_done(s1));
+        ctx.prog_wait_for(&mut got, &is_done(cb_x));
+        answer(&mut ctx, &[cb_x]);
+        std::thread::sleep(Duration::from_millis(400));
+        let mut msgs = new_frame(cb_y);
+        msgs.extend_from_slice(&build_msgs(|dst| {
+            write_req_wl_display_sync(dst, display, s2)
+        }));
+        ctx.prog_write_replies(&msgs, &[], &mut got);
+        ctx.prog_wait_for(&mut got, &is_done(cb_y));
+        assert!(dones(&got, s2) == 0);
+        got.extend(answer(&mut ctx, &[s1]));
+        ctx.prog_wait_for(&mut got, &is_done(s2));
+        assert!(dones(&got, s2) == 1);
+        answer(&mut ctx, &[cb_y, s2]);
 
         /* Once the compositor has held a callback answered here for over a second, as it does
          * for a hidden surface, the surface's next callbacks are left to it */

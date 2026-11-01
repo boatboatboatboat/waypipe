@@ -2152,9 +2152,10 @@ fn main() -> Result<ExitCode, String> {
                 .value_name("fps")
                 .help(
                     "server: Answer the program's frame callbacks locally, at most this many \
-                     times a second and only once the previous frame has been sent, and release \
-                     its buffers once their contents are captured, instead of waiting a round \
-                     trip for the compositor; 0 ⇒ wait for the compositor",
+                     times a second and only once the previous frame has been sent, and EGL's \
+                     per-frame syncs and its buffer releases once its commits are captured, \
+                     instead of waiting a round trip for the compositor; 0 ⇒ wait for the \
+                     compositor",
                 )
                 .value_parser(value_parser!(u32))
                 .default_value("0"),

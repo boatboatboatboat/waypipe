@@ -40,7 +40,7 @@ use nix::poll::{PollFd, PollFlags};
 use nix::sys::{memfd, signal, socket, time, uio};
 use nix::unistd;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{btree_map, BTreeMap, BTreeSet, VecDeque};
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
@@ -1168,7 +1168,8 @@ pub fn translate_shm_fd(
         }),
     }));
 
-    map.insert(remote_id, Rc::downgrade(&sfd));
+    let new = map.insert(remote_id, Rc::downgrade(&sfd)).is_none();
+    assert!(new);
 
     Ok(sfd)
 }
@@ -1262,7 +1263,8 @@ pub fn translate_dmabuf_fd(
         }),
     }));
 
-    map.insert(remote_id, Rc::downgrade(&sfd));
+    let new = map.insert(remote_id, Rc::downgrade(&sfd)).is_none();
+    assert!(new);
 
     Ok(sfd)
 }
@@ -1294,7 +1296,8 @@ pub fn translate_timeline(
         }),
     }));
 
-    glob.map.insert(remote_id, Rc::downgrade(&sfd));
+    let new = glob.map.insert(remote_id, Rc::downgrade(&sfd)).is_none();
+    assert!(new);
 
     Ok(sfd)
 }
@@ -1328,7 +1331,8 @@ pub fn translate_pipe_fd(
         }),
     }));
 
-    glob.map.insert(remote_id, Rc::downgrade(&sfd));
+    let new = glob.map.insert(remote_id, Rc::downgrade(&sfd)).is_none();
+    assert!(new);
     glob.pipes.push(sfd.clone());
 
     Ok(sfd)
@@ -1399,6 +1403,18 @@ fn process_sfd_msg(
             // todo: handle error
             let size = i32::from_le_bytes(msg[8..12].try_into().unwrap());
 
+            if remote_id.0.signum() != -glob.max_local_id.signum() {
+                return Err(tag!(
+                    "Remote may only create ShadowFd with sign {}, cannot use RID={}",
+                    -glob.max_local_id.signum(),
+                    remote_id
+                ));
+            }
+            let entry = glob.map.entry(remote_id);
+            if matches!(entry, btree_map::Entry::Occupied(_)) {
+                return Err(tag!("ShadowFd with RID={} already exists", remote_id));
+            }
+
             let local_fd = memfd::memfd_create(
                 c"/waypipe",
                 memfd::MFdFlags::MFD_CLOEXEC | memfd::MFdFlags::MFD_ALLOW_SEALING,
@@ -1433,7 +1449,7 @@ fn process_sfd_msg(
                 }),
             }));
 
-            glob.map.insert(remote_id, Rc::downgrade(&sfd));
+            entry.or_insert_with(|| Rc::downgrade(&sfd));
             glob.fresh.insert(remote_id, sfd);
 
             Ok(())
@@ -1627,6 +1643,18 @@ fn process_sfd_msg(
                 msg[12..76].try_into().unwrap(),
             ));
 
+            if remote_id.0.signum() != -glob.max_local_id.signum() {
+                return Err(tag!(
+                    "Remote may only create ShadowFd with sign {}, cannot use RID={}",
+                    -glob.max_local_id.signum(),
+                    remote_id
+                ));
+            }
+            let entry = glob.map.entry(remote_id);
+            if matches!(entry, btree_map::Entry::Occupied(_)) {
+                return Err(tag!("ShadowFd with RID={} already exists", remote_id));
+            }
+
             /* Restrict to compositor preferred modifiers, if any are available, or the (probably)
              * sublist of modifiers that were at one point in time acceptable for screencopy;
              * otherwise, try arbitrary format, since e.g. a Wayland client could be blindly guessing
@@ -1697,7 +1725,7 @@ fn process_sfd_msg(
                 }),
             }));
 
-            glob.map.insert(remote_id, Rc::downgrade(&sfd));
+            entry.or_insert_with(|| Rc::downgrade(&sfd));
             glob.fresh.insert(remote_id, sfd);
 
             Ok(())
@@ -1718,6 +1746,18 @@ fn process_sfd_msg(
             let view_row_stride = Some(dmabuf_slice_get_first_stride(
                 msg[12..76].try_into().unwrap(),
             ));
+
+            if remote_id.0.signum() != -glob.max_local_id.signum() {
+                return Err(tag!(
+                    "Remote may only create ShadowFd with sign {}, cannot use RID={}",
+                    -glob.max_local_id.signum(),
+                    remote_id
+                ));
+            }
+            let entry = glob.map.entry(remote_id);
+            if matches!(entry, btree_map::Entry::Occupied(_)) {
+                return Err(tag!("ShadowFd with RID={} already exists", remote_id));
+            }
 
             const H264: u32 = VideoFormat::H264 as u32;
             const VP9: u32 = VideoFormat::VP9 as u32;
@@ -1788,7 +1828,7 @@ fn process_sfd_msg(
                 }),
             }));
 
-            glob.map.insert(remote_id, Rc::downgrade(&sfd));
+            entry.or_insert_with(|| Rc::downgrade(&sfd));
             glob.fresh.insert(remote_id, sfd);
 
             Ok(())
@@ -1835,6 +1875,22 @@ fn process_sfd_msg(
                 ));
             };
 
+            if msg.len() != 16 {
+                return Err(tag!("Bad message length for OpenTimeline"));
+            }
+
+            if remote_id.0.signum() != -glob.max_local_id.signum() {
+                return Err(tag!(
+                    "Remote may only create ShadowFd with sign {}, cannot use RID={}",
+                    -glob.max_local_id.signum(),
+                    remote_id
+                ));
+            }
+            let entry = glob.map.entry(remote_id);
+            if matches!(entry, btree_map::Entry::Occupied(_)) {
+                return Err(tag!("ShadowFd with RID={} already exists", remote_id));
+            }
+
             let start_pt = u64::from_le_bytes(msg[8..16].try_into().unwrap());
             let (timeline, fd) = vulkan_create_timeline(vulk, start_pt)?;
 
@@ -1849,7 +1905,7 @@ fn process_sfd_msg(
                 }),
             }));
 
-            glob.map.insert(remote_id, Rc::downgrade(&sfd));
+            entry.or_insert_with(|| Rc::downgrade(&sfd));
             glob.fresh.insert(remote_id, sfd);
 
             Ok(())
@@ -1871,6 +1927,18 @@ fn process_sfd_msg(
         }
 
         WmsgType::OpenIRPipe | WmsgType::OpenIWPipe => {
+            if remote_id.0.signum() != -glob.max_local_id.signum() {
+                return Err(tag!(
+                    "Remote may only create ShadowFd with sign {}, cannot use RID={}",
+                    -glob.max_local_id.signum(),
+                    remote_id
+                ));
+            }
+            let entry = glob.map.entry(remote_id);
+            if matches!(entry, btree_map::Entry::Occupied(_)) {
+                return Err(tag!("ShadowFd with RID={} already exists", remote_id));
+            }
+
             let (pipe_r, pipe_w) =
                 unistd::pipe2(fcntl::OFlag::O_CLOEXEC | fcntl::OFlag::O_NONBLOCK)
                     .map_err(|x| tag!("Failed to create pipe: {:?}", x))?;
@@ -1897,7 +1965,7 @@ fn process_sfd_msg(
                 }),
             }));
 
-            glob.map.insert(remote_id, Rc::downgrade(&sfd));
+            entry.or_insert_with(|| Rc::downgrade(&sfd));
             glob.pipes.push(sfd.clone());
             glob.fresh.insert(remote_id, sfd);
 

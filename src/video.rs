@@ -1049,7 +1049,7 @@ fn create_staging_images(
                     .bind_image_memory(plane_images[plane], plane_memories[plane], 0)
             {
                 cleanup(plane_image_views, plane_images, plane_memories);
-                return Err(tag!("Failed to bind plane {} image memory: {:?}", plane, x))?;
+                return Err(tag!("Failed to bind plane {} image memory: {:?}", plane, x));
             }
 
             let image_view_info = vk::ImageViewCreateInfo::default()

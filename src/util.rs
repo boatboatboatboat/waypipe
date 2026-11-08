@@ -782,7 +782,7 @@ pub struct BadRng {
 
 impl BadRng {
     /** Get a new u64 value */
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         // Xorshift RNG, see Marsaglia 2003
         self.state ^= self.state << 13;
         self.state ^= self.state >> 7;
@@ -791,7 +791,7 @@ impl BadRng {
     }
     /** Get a new value, in the range 0..maxval; this is only approximately uniform */
     pub fn next_usize(&mut self, maxval: usize) -> usize {
-        (self.next() % maxval as u64) as usize
+        (self.next_u64() % maxval as u64) as usize
     }
 }
 

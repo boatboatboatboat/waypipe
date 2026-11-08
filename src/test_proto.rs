@@ -198,7 +198,7 @@ fn test_interact(
             assert!(e == Errno::EINTR || e == Errno::EAGAIN);
         }
 
-        for (pfd, recv) in pfds.into_iter().zip(recvs.into_iter()) {
+        for (pfd, recv) in pfds.into_iter().zip(recvs) {
             let evt = pfd.revents().unwrap();
 
             if evt.contains(poll::PollFlags::POLLIN) {
@@ -1409,7 +1409,7 @@ fn check_pipe_transfer(
                     std::cmp::max(nwritten + (1 << 20), to_send.len()) - to_send.len()
                 };
                 for _ in 0..extension {
-                    to_send.push(gen.next() as u8);
+                    to_send.push(gen.next_u64() as u8);
                 }
                 assert!(to_send.len() > nwritten);
 
@@ -4068,8 +4068,8 @@ fn proto_rotating_damage(info: TestInfo) -> TestResult {
 
         for step in 0..(3 * buffer_sequence.len() - 4) {
             let px = (
-                (rng.next() as u32 % pixel_s) as i32,
-                (rng.next() as u32 % pixel_s) as i32,
+                (rng.next_u64() as u32 % pixel_s) as i32,
+                (rng.next_u64() as u32 % pixel_s) as i32,
             );
             px_seq.push(px);
 
@@ -4082,7 +4082,7 @@ fn proto_rotating_damage(info: TestInfo) -> TestResult {
                 b + o
             };
 
-            let on_surface = rng.next() % 2 == 0;
+            let on_surface = rng.next_u64() % 2 == 0;
             let transform = transforms[buffer_sequence[buf_no].0];
             let scale = buffer_sequence[buf_no].1;
             let buf_size = (buffer_sequence[buf_no].2, buffer_sequence[buf_no].3);
@@ -4399,7 +4399,7 @@ fn proto_many_fds(info: TestInfo) -> TestResult {
         assert!(msgs.concat() == *m);
         assert!(msgs.len() == ofds.len() && msgs.len() == files.len());
         for ((_msg, rfd), (contents, _fd)) in
-            msgs.into_iter().zip(ofds.into_iter()).zip(files.iter())
+            msgs.into_iter().zip(ofds).zip(files.iter())
         {
             let v = get_file_contents(&rfd, contents.len()).unwrap();
             assert!(v == *contents);

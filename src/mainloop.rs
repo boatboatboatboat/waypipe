@@ -2159,7 +2159,7 @@ fn process_sfd_msg(
             Ok(())
         }
 
-        _ => return Err(tag!("Unhandled message type: {:?}", typ)),
+        _ => Err(tag!("Unhandled message type: {:?}", typ)),
     }
 }
 
@@ -5164,7 +5164,7 @@ fn loop_inner<'a>(
 
         let ntimelinebase_fds = pfds.len();
         let mut timelines = Vec::new();
-        for (_rid, v) in glob.map.iter() {
+        for v in glob.map.values() {
             let Some(w) = v.upgrade() else {
                 continue;
             };
@@ -5514,10 +5514,8 @@ fn loop_inner<'a>(
         })?;
 
         /* Process timeline fds being waited on */
-        let mut base_timeline_id = ntimelinebase_fds;
-        for (w, min_pt) in timelines.iter() {
+        for ((w, min_pt), base_timeline_id) in timelines.iter().zip(ntimelinebase_fds..) {
             let evts = pfd_returns[base_timeline_id];
-            base_timeline_id += 1;
 
             let mut b = w.borrow_mut();
             let rid = b.remote_id;
@@ -5566,10 +5564,8 @@ fn loop_inner<'a>(
         }
 
         /* Process DMABUFs being polled  */
-        let mut base_dmabuf_id = ndmabufbase_fds;
-        for d in dmabufs.iter() {
+        for (d, base_dmabuf_id) in dmabufs.iter().zip(ndmabufbase_fds..) {
             let evts = pfd_returns[base_dmabuf_id];
-            base_dmabuf_id += 1;
 
             let rid = d.borrow().remote_id;
 

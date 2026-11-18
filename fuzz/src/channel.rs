@@ -368,9 +368,7 @@ fn interact(
                         nbytes_sent += s;
                         nfds_sent += sfds.len();
                     }
-                    Err(Errno::EINTR) | Err(Errno::EAGAIN) => {
-                        println!("eintr");
-                    }
+                    Err(Errno::EINTR) | Err(Errno::EAGAIN) => { /* Continue */ }
                     Err(Errno::EPIPE) | Err(Errno::ECONNRESET) => {
                         recv.eof = true;
                     }

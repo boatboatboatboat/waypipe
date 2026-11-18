@@ -2130,10 +2130,15 @@ pub fn vulkan_import_dmabuf(
     /* post linux-dmabuf version 5, all planes must have same modifier */
     assert!(planes.iter().all(|x| x.modifier == modifier));
     /* Check that all planes are represented */
-    assert!(plane_perm
+    if !plane_perm
         .iter()
         .enumerate()
-        .all(|(i, x)| planes[*x].plane_idx == i as u32));
+        .all(|(i, x)| planes[*x].plane_idx == i as u32)
+    {
+        return Err(tag!(
+            "Bad plane specification for DMABUF, multiple planes share index"
+        ));
+    }
 
     let mod_index = format_data
         .modifiers

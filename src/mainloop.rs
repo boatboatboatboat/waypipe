@@ -140,7 +140,7 @@ pub struct Globals<'a> {
      * instances of the wp_presentation global (or of different globals, if a weird
      * compositor makes multiple of them). wp_commit_timer_v1 uses timestamps
      * relative to this clock. */
-    pub presentation_clock: Option<u32>,
+    pub presentation_clock: Option<libc::clockid_t>,
     /** Table of DRM format modifiers that both a) have been provided by linux-dmabuf-feedback-v1
      * b) are supported by Waypipe. Use this to restrict which modifiers to try when
      * replicating DMABUFs. */
@@ -1294,7 +1294,13 @@ pub fn translate_timeline(
     debug!("Translating timeline semaphore fd");
 
     let DmabufDevice::Vulkan((_, ref vulk)) = glob.dmabuf_device else {
-        unreachable!();
+        // NOTE: it's possible to initialize and use wp_linux_drm_syncobj_manager_v1
+        // before the device to use is ever communicated through zwp_linux_dmabuf_v1.
+        // In practice, clients will likely create DMABUFs first and won't run into
+        // this. Any exceptions may require updating this code (or the protocol itself.)
+        return Err(tag!(
+            "Received timeline semaphore before dmabuf device set up"
+        ));
     };
 
     let tm = vulkan_import_timeline(vulk, fd)?;
@@ -1940,7 +1946,9 @@ fn process_sfd_msg(
             };
 
             let DmabufDevice::Vulkan((_, ref vulk)) = glob.dmabuf_device else {
-                unreachable!();
+                return Err(tag!(
+                    "Received SendDMAVidPacket before Vulkan device was set up"
+                ));
             };
 
             let task = VideoDecodeTask {

@@ -1125,7 +1125,9 @@ fn proc_unknown_way_msg(
         let ntagfds = ((header2 & ((1 << 16) - 1)) >> 11) as usize;
         // This is usually safe for simple file transfers (like keymaps),
         // where as long as the sending side recognizes the file it can
-        // be replicated OK.
+        // be replicated OK. But without protocol references, a continuously
+        // updated file descriptor (pipe, shm or dma buffer) will be dropped
+        // and later updates to it will fail.
         if ntagfds > 0 {
             error!("Unidentified message has {} fds attached according to other Waypipe instance; blindly transferring them", ntagfds);
         }
@@ -1140,10 +1142,19 @@ fn proc_unknown_way_msg(
         }
         for sfd in x.iter().take(ntagfds) {
             let b = sfd.borrow();
-            if let ShadowFdVariant::File(data) = &b.data {
-                if data.pending_apply_tasks > 0 {
-                    return Ok(ProcMsg::WaitFor(b.remote_id));
-                }
+
+            let apply_count = if let ShadowFdVariant::File(data) = &b.data {
+                data.pending_apply_tasks
+            } else if let ShadowFdVariant::Dmabuf(data) = &b.data {
+                /* If not waiting to any timelines, which an unidentified DMABUF
+                 * should never be */
+                data.pending_apply_tasks
+            } else {
+                0
+            };
+
+            if apply_count > 0 {
+                return Ok(ProcMsg::WaitFor(b.remote_id));
             }
         }
 
@@ -1239,18 +1250,16 @@ fn timespec_midpoint(stamp_1: libc::timespec, stamp_3: libc::timespec) -> libc::
 /** Estimate the time difference between two clocks.
  *
  * Return value is: (sec_diff, nsec_diff) where nsec_diff >= 0 */
-fn clock_sub(clock_a: u32, clock_b: u32) -> Result<(i64, u32), String> {
+fn clock_sub(clock_a: libc::clockid_t, clock_b: libc::clockid_t) -> Result<(i64, u32), String> {
     let mut stamp_1 = timespec_from_sec_nsec(0, 0);
     let mut stamp_2 = stamp_1;
     let mut stamp_3 = stamp_1;
-    let ca: libc::clockid_t = clock_a.try_into().unwrap();
-    let cb: libc::clockid_t = clock_b.try_into().unwrap();
     unsafe {
         // SAFETY: clock_gettime only writes into second argument, which is repr(C)
         // and thus properly aligned
-        let ret1 = libc::clock_gettime(ca, &mut stamp_1);
-        let ret2 = libc::clock_gettime(cb, &mut stamp_2);
-        let ret3 = libc::clock_gettime(ca, &mut stamp_3);
+        let ret1 = libc::clock_gettime(clock_a, &mut stamp_1);
+        let ret2 = libc::clock_gettime(clock_b, &mut stamp_2);
+        let ret3 = libc::clock_gettime(clock_a, &mut stamp_3);
         if ret1 != 0 || ret2 != 0 || ret3 != 0 {
             return Err(tag!(
                 "clock_gettime failed for clock {} or {}",
@@ -1300,7 +1309,7 @@ fn translate_timestamp(
     tv_sec_hi: u32,
     tv_sec_lo: u32,
     tv_nsec: u32,
-    clock_id: u32,
+    clock_id: libc::clockid_t,
     to_channel: bool,
 ) -> Result<(u32, u32, u32), String> {
     if tv_nsec >= 1_000_000_000 {
@@ -1308,7 +1317,7 @@ fn translate_timestamp(
     }
 
     let tv_sec = join_u64(tv_sec_hi, tv_sec_lo);
-    let realtime = libc::CLOCK_REALTIME as u32;
+    let realtime = libc::CLOCK_REALTIME;
     let (new_sec, new_nsec) = if to_channel {
         /* Convert from clock_id to CLOCK_REALTIME */
         let (diff_sec, diff_nsec) = clock_sub(realtime, clock_id)?;
@@ -2986,6 +2995,7 @@ pub fn process_way_msg(
                 .ok_or_else(|| tag!("Unexpected size for dev_t: {}", dev.len()))?;
             feedback.main_device = Some(main_device);
 
+            // TODO: linux-dmabuf v6 will make this optional
             if glob.on_display_side && matches!(glob.dmabuf_device, DmabufDevice::VulkanSetup(_)) {
                 complete_dmabuf_setup(glob.opts, Some(main_device), &mut glob.dmabuf_device)?;
             }
@@ -3051,10 +3061,16 @@ pub fn process_way_msg(
                     ));
                 };
                 /* On display side, immediately filter out unsupported format-modifier pairs. */
-                if glob.on_display_side
-                    && !dmabuf_dev_supports_format(&glob.dmabuf_device, pair.0, pair.1)
-                {
-                    continue;
+                if glob.on_display_side {
+                    if !matches!(
+                        glob.dmabuf_device,
+                        DmabufDevice::Vulkan(_) | DmabufDevice::Gbm(_)
+                    ) {
+                        return Err(tag!("Tranche format events should be ordered after ::tranche_target_device or ::main_device"));
+                    }
+                    if !dmabuf_dev_supports_format(&glob.dmabuf_device, pair.0, pair.1) {
+                        continue;
+                    }
                 }
                 feedback.current.values.push(*pair);
             }
@@ -3938,7 +3954,7 @@ pub fn process_way_msg(
                 tv_sec_hi,
                 tv_sec_lo,
                 tv_nsec,
-                libc::CLOCK_MONOTONIC as u32,
+                libc::CLOCK_MONOTONIC,
                 glob.on_display_side,
             )?;
             write_evt_zwlr_screencopy_frame_v1_ready(
@@ -3988,7 +4004,7 @@ pub fn process_way_msg(
                 tv_sec_hi,
                 tv_sec_lo,
                 tv_nsec,
-                libc::CLOCK_MONOTONIC as u32,
+                libc::CLOCK_MONOTONIC,
                 glob.on_display_side,
             )?;
             write_evt_ext_image_copy_capture_frame_v1_presentation_time(
@@ -4158,8 +4174,8 @@ pub fn process_way_msg(
             let clock_id = glob.presentation_clock.unwrap_or_else(|| {
                 error!("wp_presentation_feedback::presented timestamp was received before any wp_presentation::clock event,\
                         so Waypipe assumes CLOCK_MONOTONIC was used and may misconvert times if wrong.");
-                libc::CLOCK_MONOTONIC as u32
-            }            );
+                libc::CLOCK_MONOTONIC
+            });
             let (new_sec_hi, new_sec_lo, new_nsec) = translate_timestamp(
                 tv_sec_hi,
                 tv_sec_lo,
@@ -4175,6 +4191,13 @@ pub fn process_way_msg(
         (WaylandInterface::WpPresentation, OPCODE_WP_PRESENTATION_CLOCK_ID) => {
             check_space!(msg.len(), 0, remaining_space);
             let clock_id = parse_evt_wp_presentation_clock_id(msg)?;
+            let Ok(clock_id) = clock_id.try_into() else {
+                return Err(tag!(
+                    "Invalid clock ID value {} for wp_presentation::clock_id",
+                    clock_id
+                ));
+            };
+
             if let Some(old) = glob.presentation_clock {
                 if clock_id != old {
                     return Err(tag!(
@@ -4198,7 +4221,7 @@ pub fn process_way_msg(
             let clock_id = glob.presentation_clock.unwrap_or_else(|| {
                 error!("wp_commit_timer_v1::set_timestamp was received before wp_presentation::clock,\
                         so Waypipe assumes CLOCK_MONOTONIC was used and may misconvert times if wrong.");
-                libc::CLOCK_MONOTONIC as u32
+                libc::CLOCK_MONOTONIC
             }            );
             let (new_sec_hi, new_sec_lo, new_nsec) = translate_timestamp(
                 tv_sec_hi,

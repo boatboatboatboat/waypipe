@@ -4398,9 +4398,7 @@ fn proto_many_fds(info: TestInfo) -> TestResult {
 
         assert!(msgs.concat() == *m);
         assert!(msgs.len() == ofds.len() && msgs.len() == files.len());
-        for ((_msg, rfd), (contents, _fd)) in
-            msgs.into_iter().zip(ofds).zip(files.iter())
-        {
+        for ((_msg, rfd), (contents, _fd)) in msgs.into_iter().zip(ofds).zip(files.iter()) {
             let v = get_file_contents(&rfd, contents.len()).unwrap();
             assert!(v == *contents);
         }

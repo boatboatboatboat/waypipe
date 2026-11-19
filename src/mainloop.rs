@@ -5772,7 +5772,9 @@ fn loop_end_to_channel(
 
     let mut nwritten_err = 0;
     /* Attach protocol header, RIDs to in progress messages if needed */
-    process_wayland_2(from_way);
+    if !has_pending_compute_tasks(&from_way.output) {
+        process_wayland_2(from_way);
+    }
 
     while has_from_way_output(&from_way.output) || nwritten_err < endmsg.len() {
         let mut pfds = [PollFd::new(chanfd.as_fd(), PollFlags::POLLOUT)];

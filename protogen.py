@@ -80,6 +80,7 @@ handled_funcs = [
     ("wl_surface", "damage"),
     ("wl_surface", "damage_buffer"),
     ("wl_surface", "destroy"),
+    ("wl_surface", "frame"),
     ("wl_surface", "set_buffer_scale"),
     ("wl_surface", "set_buffer_transform"),
     ("wp_color_management_output_v1", "get_image_description"),

@@ -302,10 +302,12 @@ fn build_connection_command<'a>(
         SocketSpec::VSock(x) => strings.push(format!("{}", x).into()),
         SocketSpec::Unix(x) => strings.push(x.into()),
     };
+    strings.push(OsString::from(options.frame_rate.to_string()));
     let comp_str = &strings[0];
     let thread_str = &strings[1];
     let vid_str = &strings[2];
     let socket_str = &strings[3];
+    let frame_rate_str = &strings[4];
 
     /* Unlike the parent process, use short option names for these, making the command
      * line shorter and easier to skim */
@@ -330,6 +332,10 @@ fn build_connection_command<'a>(
     }
     if options.video.format.is_some() {
         args.push(vid_str);
+    }
+    if options.frame_rate > 0 && !client {
+        args.push(OsStr::new("--frame-rate"));
+        args.push(frame_rate_str);
     }
     if let Some(d) = &options.drm_node {
         assert!(!client);
@@ -2141,6 +2147,20 @@ fn main() -> Result<ExitCode, String> {
                 .default_value("0"),
         )
         .arg(
+            Arg::new("frame-rate")
+                .long("frame-rate")
+                .value_name("fps")
+                .help(
+                    "server: Answer the program's frame callbacks locally, at most this many \
+                     times a second and only once the previous frame has been sent, and EGL's \
+                     per-frame syncs and its buffer releases once its commits are captured, \
+                     instead of waiting a round trip for the compositor; 0 ⇒ wait for the \
+                     compositor",
+                )
+                .value_parser(value_parser!(u32))
+                .default_value("0"),
+        )
+        .arg(
             Arg::new("title-prefix")
                 .long("title-prefix")
                 .value_name("str")
@@ -2298,6 +2318,7 @@ fn main() -> Result<ExitCode, String> {
     let title_prefix = matches.get_one::<String>("title-prefix").unwrap();
     let display = matches.get_one::<PathBuf>("display");
     let threads = matches.get_one::<u32>("threads").unwrap();
+    let frame_rate = *matches.get_one::<u32>("frame-rate").unwrap();
     let unlink = *matches.get_one::<bool>("unlink-socket").unwrap();
     let mut compression: Compression = *matches.get_one::<Compression>("compress").unwrap();
     let mut video: VideoSetting = *matches.get_one::<VideoSetting>("video").unwrap();
@@ -2388,6 +2409,7 @@ fn main() -> Result<ExitCode, String> {
         compression,
         video,
         threads: *threads,
+        frame_rate,
         title_prefix: (*title_prefix).clone(),
         drm_node: drm_node.cloned(),
         test_skip_vulkan,
@@ -2507,6 +2529,11 @@ fn main() -> Result<ExitCode, String> {
             ssh_cmd.push(OsStr::new("--threads"));
             let arg_nthreads = OsString::from(opts.threads.to_string());
             ssh_cmd.push(&arg_nthreads);
+            let arg_frame_rate = OsString::from(opts.frame_rate.to_string());
+            if opts.frame_rate > 0 {
+                ssh_cmd.push(OsStr::new("--frame-rate"));
+                ssh_cmd.push(&arg_frame_rate);
+            }
 
             let arg_drm_node_val;
             if let Some(r) = remote_node {

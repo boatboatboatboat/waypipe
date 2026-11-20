@@ -91,6 +91,8 @@ mod proto {
     define_test! {damage_efficiency}
     define_test! {fixes}
     define_test! {flip_damage}
+    define_test! {frame_rate}
+    define_test! {frame_rate_release}
     define_test! {gamma_control}
     define_test! {keymap}
     define_test! {icc}
@@ -112,6 +114,8 @@ mod proto {
     define_test! {dmabuf}
     #[cfg(feature = "dmabuf")]
     define_test! {dmabuf_damage}
+    #[cfg(feature = "dmabuf")]
+    define_test! {dmabuf_compositor_hold}
     #[cfg(feature = "dmabuf")]
     define_test! {dmabuf_feedback_table}
     #[cfg(feature = "dmabuf")]

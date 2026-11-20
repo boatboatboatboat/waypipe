@@ -4955,6 +4955,23 @@ pub fn parse_req_wl_surface_damage<'a>(
     Ok((arg1, arg2, arg3, arg4))
 }
 pub const OPCODE_WL_SURFACE_DAMAGE: MethodId = MethodId::Request(2);
+pub fn write_req_wl_surface_frame(dst: &mut &mut [u8], for_id: ObjId, callback: ObjId) {
+    let l = length_req_wl_surface_frame();
+    write_header(dst, for_id, l, 3, 0);
+    write_obj(dst, callback);
+}
+pub fn length_req_wl_surface_frame() -> usize {
+    12
+}
+pub fn parse_req_wl_surface_frame<'a>(mut msg: &'a [u8]) -> Result<ObjId, &'static str> {
+    msg = msg.get(8..).ok_or(PARSE_ERROR)?;
+    let arg1 = parse_obj(&mut msg)?;
+    if !msg.is_empty() {
+        return Err(PARSE_ERROR);
+    }
+    Ok(arg1)
+}
+pub const OPCODE_WL_SURFACE_FRAME: MethodId = MethodId::Request(3);
 pub fn write_req_wl_surface_commit(dst: &mut &mut [u8], for_id: ObjId) {
     let l = length_req_wl_surface_commit();
     write_header(dst, for_id, l, 6, 0);

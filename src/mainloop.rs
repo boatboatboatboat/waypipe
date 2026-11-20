@@ -48,6 +48,7 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /** Whether a message transfer direction is active, shutting down, or off.
  *
@@ -151,6 +152,13 @@ pub struct Globals<'a> {
      * creates to be safe. */
     pub screencopy_restrictions: BTreeMap<u32, Vec<u64>>,
 
+    /** Frame callbacks the server answers itself (Options::frame_rate) */
+    pub local_frames: LocalFrames,
+    /** On the display side, the DMABUFs committed to a surface and not yet released by the
+     * compositor, which it may be reading: scanned out directly, the display reads a buffer
+     * until the next one takes its place. New contents for one of these wait. */
+    pub compositor_holds: BTreeSet<Rid>,
+
     /** Options. */
     pub opts: &'a Options,
 
@@ -162,6 +170,192 @@ pub struct Globals<'a> {
     has_first_message: bool,
     /** Has a Close message arrived (implying a clean and deliberate connection shutdown). */
     has_received_close: bool,
+}
+
+/** Frame callbacks the server answers itself, ahead of the compositor, so that a program's
+ * frame rate is bounded by how fast its frames are sent rather than by the round trip to the
+ * compositor.
+ *
+ * Every entry here names objects of the program; the compositor's wl_display.delete_id for an
+ * object, after which the program may reuse its id, removes the entries naming it (forget()). */
+pub struct LocalFrames {
+    /** Callbacks requested with wl_surface.frame since their surface's last commit, as
+     * (surface, callback) */
+    pub requested: Vec<(ObjId, ObjId)>,
+    /** Callbacks whose surface has committed, to be answered, as (surface, callback) */
+    pub due: Vec<(ObjId, ObjId)>,
+    /** Callbacks answered here whose done event from the compositor is still to be dropped,
+     * with the surface of a frame callback and when it was answered */
+    pub answered: BTreeMap<ObjId, (Option<ObjId>, Instant)>,
+    /** Buffers attached since their surface's last commit, as (surface, buffer) */
+    pub attached: Vec<(ObjId, ObjId)>,
+    /** Surfaces whose last commit showed a buffer, whose next commit of a buffer the program
+     * can observe only through its frame callbacks and buffer releases */
+    pub shown: BTreeSet<ObjId>,
+    /** The buffer each surface last committed, which the compositor still shows: it is released
+     * to the program only once a newer commit replaces it, since the display side writes the
+     * program's next contents into its copy of whichever buffer the program draws to */
+    pub showing: BTreeMap<ObjId, ObjId>,
+    /** Buffers replaced on their surface, to be released to the program once their replacements
+     * are captured */
+    pub release_due: Vec<ObjId>,
+    /** Per buffer, the releases the server sent whose counterparts from the compositor are still
+     * to be dropped */
+    pub released_here: BTreeMap<ObjId, u32>,
+    /** Whether every request since the program's last wl_display.sync only updated surface
+     * contents, so that the compositor answering a sync now would tell the program nothing it
+     * can observe */
+    pub content_only: bool,
+    /** Whether a request giving new contents came since the program's last wl_display.sync: a
+     * sync with none before it waits for the compositor's answer, as a loop of round trips
+     * waiting for a compositor event does */
+    pub new_contents: bool,
+    /** wl_display.sync callbacks answered here, once the commits before them are captured */
+    pub sync_due: Vec<ObjId>,
+    /** wl_display.sync callbacks the compositor answers, still unanswered; while any is, later
+     * syncs go to the compositor too, so that the program gets their answers in order */
+    pub remote_syncs: BTreeSet<ObjId>,
+    /** When callbacks were last answered */
+    pub last_answer: Option<Instant>,
+    /** Base of the millisecond timestamps sent in wl_callback.done */
+    pub epoch: Instant,
+    /** For each callback answered here whose answer from the compositor has arrived, oldest
+     * first, when it arrived and how long after the server's answer; shortest_round_trip()
+     * reads those of the last ROUND_TRIP_WINDOW */
+    pub round_trips: VecDeque<(Instant, Duration)>,
+}
+
+/** How long a frame callback answered here may wait for the compositor's own answer before the
+ * surface's next callbacks are left to the compositor: a compositor answers a shown surface's
+ * callbacks within a round trip and a frame, and holds those of a surface it throttles, such as
+ * a hidden one. */
+const LOCAL_FRAME_HOLD: Duration = Duration::from_secs(1);
+
+/** How much longer than the shortest recent round trip a surface's oldest callback answered here
+ * may wait for the compositor's answer before the surface's next callbacks wait too: frames
+ * written to the connection faster than the link carries them queue up, and every later answer
+ * from the compositor comes that much later, so this bounds the queue the program can build */
+const LOCAL_FRAME_QUEUE: Duration = Duration::from_millis(100);
+
+/** How far back the shortest round trip is taken from */
+const ROUND_TRIP_WINDOW: Duration = Duration::from_secs(10);
+
+/** The shortest of the round trips that arrived within ROUND_TRIP_WINDOW before `now`; none
+ * after an idle stretch longer than that, as before the first answer, so a link whose round trip
+ * changed while idle is not held to its old one */
+fn shortest_round_trip(
+    round_trips: &VecDeque<(Instant, Duration)>,
+    now: Instant,
+) -> Option<Duration> {
+    round_trips
+        .iter()
+        .filter(|&&(t, _)| now.saturating_duration_since(t) <= ROUND_TRIP_WINDOW)
+        .map(|&(_, d)| d)
+        .min()
+}
+
+/* For samples that arrived at any time up to `now`: the result is a duration of a sample that
+ * arrived within ROUND_TRIP_WINDOW and no longer than any other such sample's, none when no
+ * sample did, and samples older than that change nothing, the window's own edge included. */
+#[test]
+fn test_shortest_round_trip() {
+    let now = Instant::now() + Duration::from_secs(60);
+    let mut seed: u64 = 1;
+    let mut next = |bound: u64| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) % bound
+    };
+    for _ in 0..1000 {
+        let mut samples = VecDeque::new();
+        for _ in 0..next(6) {
+            /* Ages up to 20 s, with the window's edge and the instant itself drawn often */
+            let age = match next(4) {
+                0 => ROUND_TRIP_WINDOW,
+                1 => Duration::ZERO,
+                _ => Duration::from_millis(next(20_000)),
+            };
+            samples.push_back((now - age, Duration::from_millis(next(500))));
+        }
+        let recent: Vec<Duration> = samples
+            .iter()
+            .filter(|&&(t, _)| now - t <= ROUND_TRIP_WINDOW)
+            .map(|&(_, d)| d)
+            .collect();
+        let got = shortest_round_trip(&samples, now);
+        match got {
+            None => assert!(recent.is_empty(), "{:?}", samples),
+            Some(d) => {
+                assert!(recent.contains(&d), "{:?}", samples);
+                assert!(recent.iter().all(|&r| d <= r), "{:?}", samples);
+            }
+        }
+        /* An older sample, however short, changes nothing */
+        let mut older = samples.clone();
+        older.push_front((
+            now - ROUND_TRIP_WINDOW - Duration::from_millis(1),
+            Duration::ZERO,
+        ));
+        assert_eq!(shortest_round_trip(&older, now), got, "{:?}", samples);
+    }
+}
+
+impl LocalFrames {
+    /** Remove every entry naming `id`, which the compositor has released for reuse */
+    pub fn forget(&mut self, id: ObjId) {
+        self.requested.retain(|&(s, c)| s != id && c != id);
+        self.due.retain(|&(s, c)| s != id && c != id);
+        self.answered
+            .retain(|&c, &mut (s, _)| c != id && s != Some(id));
+        self.attached.retain(|&(s, b)| s != id && b != id);
+        self.shown.remove(&id);
+        self.release_due.retain(|&b| b != id);
+        self.showing.retain(|&s, &mut b| s != id && b != id);
+        self.released_here.remove(&id);
+        self.sync_due.retain(|&c| c != id);
+        self.remote_syncs.remove(&id);
+    }
+
+    /** Whether a frame callback of `surface` answered here has waited longer than
+     * LOCAL_FRAME_HOLD for the compositor's answer */
+    fn held(&self, surface: ObjId, now: Instant) -> bool {
+        self.answered
+            .values()
+            .any(|&(s, t)| s == Some(surface) && now.duration_since(t) > LOCAL_FRAME_HOLD)
+    }
+
+    /** Record that the compositor answered, at `now`, a callback the server answered at
+     * `answered_at`; samples older than ROUND_TRIP_WINDOW are dropped here, and ignored by
+     * shortest_round_trip() until then */
+    pub fn answer_returned(&mut self, answered_at: Instant, now: Instant) {
+        self.round_trips
+            .push_back((now, now.saturating_duration_since(answered_at)));
+        while self
+            .round_trips
+            .front()
+            .is_some_and(|&(t, _)| now.duration_since(t) > ROUND_TRIP_WINDOW)
+        {
+            self.round_trips.pop_front();
+        }
+    }
+
+    /** Whether the oldest frame callback of `surface` answered here, or with None the oldest
+     * wl_display.sync, has waited for the compositor's answer more than LOCAL_FRAME_QUEUE longer
+     * than the shortest recent round trip; never before a round trip has been seen */
+    fn behind(&self, surface: Option<ObjId>, now: Instant) -> bool {
+        let Some(shortest) = shortest_round_trip(&self.round_trips, now) else {
+            return false;
+        };
+        self.answered
+            .values()
+            .any(|&(s, t)| s == surface && now.duration_since(t) > shortest + LOCAL_FRAME_QUEUE)
+    }
+
+    /** The millisecond timestamp for a wl_callback.done sent at `now` */
+    pub fn callback_time(&self, now: Instant) -> u32 {
+        now.duration_since(self.epoch).as_millis() as u32
+    }
 }
 
 /** Data received from a Wayland connection */
@@ -201,6 +395,8 @@ struct FromChannel<'a> {
 
     /* If set, waiting for all apply operations on the given RID to complete */
     waiting_for: Option<Rid>,
+    /** A DMABUF whose new contents wait for the compositor to release it, until the time given */
+    held_for: Option<(Rid, Instant)>,
 
     // number of messages read and processed. Note: lookahead into the buffer is
     // fine, but ultimately not necessary
@@ -4061,6 +4257,11 @@ fn run_decode_task(task: VideoDecodeTask, cache: &mut ThreadCache) -> TaskResult
     )))
 }
 
+/** How long new contents wait for the compositor to release their buffer, before being written
+ * anyway. A compositor may keep a buffer indefinitely, as with a synchronized subsurface whose
+ * parent's commit is behind these contents on the channel. */
+const COMPOSITOR_HOLD_LIMIT: Duration = Duration::from_millis(100);
+
 /** Process messages received from the channel to the other Waypipe instance */
 fn process_channel(
     chan_msg: &mut FromChannel,
@@ -4243,6 +4444,19 @@ fn process_channel(
             }
             WmsgType::Close => {
                 glob.has_received_close = true;
+            }
+            WmsgType::BufferDiff | WmsgType::BufferFill | WmsgType::SendDMAVidPacket
+                if glob.on_display_side
+                    && msg.len() >= 8
+                    && glob
+                        .compositor_holds
+                        .contains(&Rid(i32::from_le_bytes(msg[4..8].try_into().unwrap()))) =>
+            {
+                let rid = Rid(i32::from_le_bytes(msg[4..8].try_into().unwrap()));
+                debug!("New contents for dmabuf rid={} wait for its release", rid);
+                chan_msg.held_for = Some((rid, Instant::now() + COMPOSITOR_HOLD_LIMIT));
+                chan_msg.message_counter -= 1;
+                return Ok(());
             }
             _ => {
                 let mut tmp = None;
@@ -4623,6 +4837,100 @@ fn has_pending_compute_tasks(from_way_output: &TransferQueue) -> bool {
     from_way_output.expected_recvd_msgs > 0
 }
 
+/** Release the buffers replaced by commits that have been captured, and answer the frame
+ * callbacks that are due, once everything from the program's previous frames has been processed
+ * and written to the channel and at most once per frame interval (Options::frame_rate). Returns
+ * how long until callbacks may next be answered, if only that interval holds them back; other
+ * holds end with an event the main loop already polls for. */
+fn answer_local_frames(
+    glob: &mut Globals,
+    from_chan: &mut FromChannel,
+    from_way: &FromWayland,
+) -> Option<Duration> {
+    let frames = &mut glob.local_frames;
+    if (frames.due.is_empty() && frames.release_due.is_empty() && frames.sync_due.is_empty())
+        /* Committed buffers have been read once the work their commits started is done */
+        || has_pending_compute_tasks(&from_way.output)
+        /* Messages are only added to the Wayland-bound buffer once it has been flushed */
+        || has_from_chan_output(&from_chan.output)
+    {
+        return None;
+    }
+
+    let mut dst = &mut from_chan.output.data[..];
+    let orig_len = dst.len();
+
+    let n_release = std::cmp::min(
+        dst.len() / length_evt_wl_buffer_release(),
+        frames.release_due.len(),
+    );
+    for buffer in frames.release_due.drain(..n_release) {
+        write_evt_wl_buffer_release(&mut dst, buffer);
+        *frames.released_here.entry(buffer).or_insert(0) += 1;
+    }
+    let now = Instant::now();
+    /* A sync waits on no frame interval: the program paces itself by its frame callbacks. Syncs
+     * queued on the link wait, in order, for the compositor's answers to catch up. */
+    let n_sync = if frames.behind(None, now) {
+        0
+    } else {
+        std::cmp::min(
+            dst.len() / length_evt_wl_callback_done(),
+            frames.sync_due.len(),
+        )
+    };
+    for cb in frames.sync_due.drain(..n_sync) {
+        write_evt_wl_callback_done(&mut dst, cb, 0);
+        frames.answered.insert(cb, (None, now));
+    }
+
+    let mut wait = None;
+    if !frames.due.is_empty() {
+        let next = frames
+            .last_answer
+            .map(|last| last + Duration::from_secs(1) / glob.opts.frame_rate);
+        if has_from_way_output(&from_way.output) {
+            /* The previous frame is still being written to the channel */
+        } else if next.is_some_and(|t| now < t) {
+            wait = next.map(|t| t - now);
+        } else {
+            /* Only the done event: the compositor's delete_id releases the id (tracking.rs).
+             * A surface the compositor holds callbacks of keeps its due ones for the
+             * compositor to answer (tracking.rs), so its program waits as it would unproxied;
+             * one whose frames queue on the link keeps them until the compositor's answers
+             * catch up, each of which wakes this loop. */
+            let time_ms = frames.callback_time(now);
+            let mut kept = Vec::new();
+            let mut n = 0;
+            for (surface, cb) in std::mem::take(&mut frames.due) {
+                if dst.len() < length_evt_wl_callback_done()
+                    || frames.held(surface, now)
+                    || frames.behind(Some(surface), now)
+                {
+                    kept.push((surface, cb));
+                    continue;
+                }
+                write_evt_wl_callback_done(&mut dst, cb, time_ms);
+                frames.answered.insert(cb, (Some(surface), now));
+                n += 1;
+            }
+            frames.due = kept;
+            if n > 0 {
+                frames.last_answer = Some(now);
+                debug!("Answered {} frame callbacks locally", n);
+            }
+        }
+    }
+
+    let written = orig_len - dst.len();
+    if written > 0 {
+        from_chan.output.start = 0;
+        from_chan.output.len = written;
+        debug!("Released {} buffers locally", n_release);
+    }
+    wait
+}
+
 /** Identify a task which can be run, if one exists */
 fn pop_task(tasksys: &mut TaskSet) -> Option<WorkTask> {
     /* Task priorities are chosen to minimize the amount of data in-flight */
@@ -4970,6 +5278,23 @@ fn loop_inner<'a>(
     let mut vulkan_wait_pipe_r: Option<OwnedFd> = None;
 
     while from_chan.state != DirectionState::Off || from_way.state != DirectionState::Off {
+        let local_frames_wait = answer_local_frames(glob, from_chan, from_way);
+        if let Some((rid, until)) = from_chan.held_for {
+            if !glob.compositor_holds.contains(&rid) {
+                from_chan.held_for = None;
+            } else if Instant::now() >= until {
+                debug!("Compositor kept dmabuf rid={}; writing to it anyway", rid);
+                glob.compositor_holds.remove(&rid);
+                from_chan.held_for = None;
+            }
+        }
+        let held_wait = from_chan
+            .held_for
+            .map(|(_, until)| until.saturating_duration_since(Instant::now()));
+        let poll_wait = match (local_frames_wait, held_wait) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let has_chan_output =
             has_from_way_output(&from_way.output) && from_way.state != DirectionState::Off;
         let has_way_output =
@@ -4989,6 +5314,7 @@ fn loop_inner<'a>(
             && (from_way.state == DirectionState::On || from_way.state == DirectionState::Drain);
         let work_chan = is_from_chan_processable(from_chan)
             && from_chan.waiting_for.is_none()
+            && from_chan.held_for.is_none()
             && (from_chan.state == DirectionState::On || from_chan.state == DirectionState::Drain);
         let work_to_do_now = (work_way && !has_chan_output) || (work_chan && !has_way_output);
 
@@ -5239,7 +5565,7 @@ fn loop_inner<'a>(
             if work_to_do_now {
                 Some(zero_timeout)
             } else {
-                None
+                poll_wait.map(time::TimeSpec::from_duration)
             },
             Some(*pollmask),
         );
@@ -5673,6 +5999,7 @@ fn loop_inner<'a>(
         if is_from_chan_processable(from_chan)
             && (from_chan.state == DirectionState::On || from_chan.state == DirectionState::Drain)
             && from_chan.waiting_for.is_none()
+            && from_chan.held_for.is_none()
             && !has_from_chan_output(&from_chan.output)
         {
             process_channel(from_chan, glob, tasksys)?;
@@ -5910,6 +6237,9 @@ pub struct Options {
     pub video: VideoSetting,
     /** Number of worker threads to use for diff/compression operations; 0=autoselect */
     pub threads: u32,
+    /** If nonzero, the server answers the program's frame callbacks itself, at most this many
+     * times a second, instead of waiting for the compositor's answers */
+    pub frame_rate: u32,
     /** A valid utf8 string with which to prefix xdg toplevel titles */
     pub title_prefix: String,
     /* If true, filter out protocols and messages using dmabufs */
@@ -5952,6 +6282,7 @@ pub fn main_interface_loop(
         },
         message_counter: 0,
         waiting_for: None,
+        held_for: None,
     };
     let mut from_way = FromWayland {
         state: DirectionState::On,
@@ -6004,6 +6335,24 @@ pub fn main_interface_loop(
         presentation_clock: None,
         advertised_modifiers: BTreeMap::new(),
         screencopy_restrictions: BTreeMap::new(),
+        compositor_holds: BTreeSet::new(),
+        local_frames: LocalFrames {
+            requested: Vec::new(),
+            due: Vec::new(),
+            answered: BTreeMap::new(),
+            attached: Vec::new(),
+            shown: BTreeSet::new(),
+            release_due: Vec::new(),
+            showing: BTreeMap::new(),
+            released_here: BTreeMap::new(),
+            content_only: true,
+            new_contents: false,
+            sync_due: Vec::new(),
+            remote_syncs: BTreeSet::new(),
+            last_answer: None,
+            epoch: Instant::now(),
+            round_trips: VecDeque::new(),
+        },
         opts,
         wire_version: init_wire_version,
         has_first_message: false,

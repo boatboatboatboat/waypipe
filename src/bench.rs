@@ -497,11 +497,7 @@ pub fn run_benchmark(opts: &Options, fast_mode: bool) -> Result<(), String> {
         img_results.push((imgspeed_diff.0, imgspeed_apply.0, imgratio));
     }
 
-    let nthreads = if opts.threads == 0 {
-        std::cmp::max(1, std::thread::available_parallelism().unwrap().get() / 2)
-    } else {
-        opts.threads as usize
-    };
+    let nthreads = worker_thread_count(opts.threads);
     println!(
         "With {} threads, estimated time for a 32 MB (4k) image transfer, assuming:",
         nthreads

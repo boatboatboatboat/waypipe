@@ -131,6 +131,15 @@ pub enum WmsgType {
     Version = 23,
 }
 
+/** The number of worker threads the --threads option asks for: 0 ⇒ half the hardware threads */
+pub fn worker_thread_count(option: u32) -> usize {
+    if option == 0 {
+        std::cmp::max(1, std::thread::available_parallelism().unwrap().get() / 2)
+    } else {
+        option as usize
+    }
+}
+
 pub fn align(x: usize, y: usize) -> usize {
     y * ((x.checked_add(y - 1).unwrap()) / y)
 }

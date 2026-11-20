@@ -224,11 +224,11 @@ unsafe fn construct_diff_segment_two_avx2(
             // Q: are nontemporal memory hints worthwhile when buffer size is large?
             // (_mm256_stream_load_si256 _may_ be useful for certain GPU-visible memory types,
             // but not elsewhere)
-            let t1 = _mm256_load_si256(target.as_ptr().add(64 * i) as *const _);
-            let t2 = _mm256_load_si256(target.as_ptr().add(64 * i + 32) as *const _);
+            let t1 = _mm256_load_si256(target.as_ptr().add(64 * i).cast());
+            let t2 = _mm256_load_si256(target.as_ptr().add(64 * i + 32).cast());
 
-            let r1 = _mm256_load_si256(reference.as_ptr().add(64 * i) as *const _);
-            let r2 = _mm256_load_si256(reference.as_ptr().add(64 * i + 32) as *const _);
+            let r1 = _mm256_load_si256(reference.as_ptr().add(64 * i).cast());
+            let r2 = _mm256_load_si256(reference.as_ptr().add(64 * i + 32).cast());
 
             let d1 = _mm256_cmpeq_epi32(t1, r1);
             let d2 = _mm256_cmpeq_epi32(t2, r2);
@@ -259,8 +259,8 @@ unsafe fn construct_diff_segment_two_avx2(
                 let ncom = (_tzcnt_u64(!new_mask) >> 2) as usize;
                 trailing_unchanged = (_lzcnt_u64(!new_mask) >> 2) as usize;
 
-                _mm256_store_si256(reference.as_mut_ptr().add(64 * i) as *mut _, t1);
-                _mm256_store_si256(reference.as_mut_ptr().add(64 * i + 32) as *mut _, t2);
+                _mm256_store_si256(reference.as_mut_ptr().add(64 * i).cast(), t1);
+                _mm256_store_si256(reference.as_mut_ptr().add(64 * i + 32).cast(), t2);
 
                 // last_nontrivial_trailing = trailing_unchanged;
 
@@ -271,12 +271,12 @@ unsafe fn construct_diff_segment_two_avx2(
                 let estoremask = _mm256_cvtepi8_epi64(halfsize);
                 _mm256_maskstore_epi32(
                     /* the overwritten portion gets masked out, but can technically cover _before_ the diff array start. alternatively use _mm256_permutevar8x32_epi32 */
-                    diff.as_mut_ptr().wrapping_sub(block_shift * 4) as *mut _,
+                    diff.as_mut_ptr().wrapping_sub(block_shift * 4).cast(),
                     estoremask,
                     if ncom < 8 { t1 } else { t2 },
                 );
                 if ncom < 8 {
-                    _mm256_storeu_si256(diff.as_mut_ptr().add(4 * (8 - block_shift)) as *mut _, t2);
+                    _mm256_storeu_si256(diff.as_mut_ptr().add(4 * (8 - block_shift)).cast(), t2);
                 }
                 dc += 16 - ncom;
 
@@ -293,11 +293,11 @@ unsafe fn construct_diff_segment_two_avx2(
         // let mut nclear = 0;
         /* Produce diff */
         while i < nslabs {
-            let t1 = _mm256_load_si256(target.as_ptr().add(64 * i) as *const _);
-            let t2 = _mm256_load_si256(target.as_ptr().add(64 * i + 32) as *const _);
+            let t1 = _mm256_load_si256(target.as_ptr().add(64 * i).cast());
+            let t2 = _mm256_load_si256(target.as_ptr().add(64 * i + 32).cast());
 
-            let r1 = _mm256_load_si256(reference.as_ptr().add(64 * i) as *const _);
-            let r2 = _mm256_load_si256(reference.as_ptr().add(64 * i + 32) as *const _);
+            let r1 = _mm256_load_si256(reference.as_ptr().add(64 * i).cast());
+            let r2 = _mm256_load_si256(reference.as_ptr().add(64 * i + 32).cast());
 
             let d1 = _mm256_cmpeq_epi32(t1, r1);
             let d2 = _mm256_cmpeq_epi32(t2, r2);
@@ -313,8 +313,8 @@ unsafe fn construct_diff_segment_two_avx2(
 
             // last_nontrivial_trailing = clear * last_nontrivial_trailing + (1 - clear) * trail_count;
 
-            _mm256_storeu_si256(diff.as_mut_ptr().add(4 * (dc - idc)) as *mut _, t1);
-            _mm256_storeu_si256(diff.as_mut_ptr().add(4 * (dc - idc) + 32) as *mut _, t2);
+            _mm256_storeu_si256(diff.as_mut_ptr().add(4 * (dc - idc)).cast(), t1);
+            _mm256_storeu_si256(diff.as_mut_ptr().add(4 * (dc - idc) + 32).cast(), t2);
             dc += 16;
 
             // todo: consider requiring 'clear' X times in a row, rather than branching based off trailing_unchanged
@@ -324,8 +324,8 @@ unsafe fn construct_diff_segment_two_avx2(
                 break;
             }
 
-            _mm256_store_si256(reference.as_ptr().add(64 * i) as *mut _, t1);
-            _mm256_store_si256(reference.as_ptr().add(64 * i + 32) as *mut _, t2);
+            _mm256_store_si256(reference.as_mut_ptr().add(64 * i).cast(), t1);
+            _mm256_store_si256(reference.as_mut_ptr().add(64 * i + 32).cast(), t2);
 
             i += 1;
         }

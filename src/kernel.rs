@@ -265,10 +265,11 @@ unsafe fn construct_diff_segment_two_avx2(
                 // last_nontrivial_trailing = trailing_unchanged;
 
                 let block_shift = ncom & 7;
-                let esmask: u64 = 0xffffffffu64 << (block_shift * 4);
+                let esmask: u64 = (!0u64) << (block_shift * 8);
 
                 let halfsize = _mm_set_epi64x(0i64, esmask as i64);
-                let estoremask = _mm256_cvtepi8_epi64(halfsize);
+                let estoremask = _mm256_cvtepi8_epi32(halfsize);
+
                 _mm256_maskstore_epi32(
                     /* the overwritten portion gets masked out, but can technically cover _before_ the diff array start. alternatively use _mm256_permutevar8x32_epi32 */
                     diff.as_mut_ptr().wrapping_sub(block_shift * 4).cast(),

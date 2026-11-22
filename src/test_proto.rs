@@ -3550,6 +3550,156 @@ fn proto_dmabuf_damage(info: TestInfo, device: RenderDevice) -> TestResult {
     Ok(StatusOk::Pass)
 }
 
+/** Read from `socket` until a whole message to `obj` with `opcode` has arrived and what was read
+ * ends on a message boundary, or until the end marker of the write that carried it; return the
+ * messages read before that marker, and whether the marker was read. */
+#[cfg(feature = "dmabuf")]
+fn test_read_until_msg(socket: &OwnedFd, obj: ObjId, opcode: MethodId) -> (Vec<u8>, bool) {
+    let mut recv = ReadRecv {
+        data: Vec::new(),
+        fds: Vec::new(),
+        eof: false,
+    };
+    let start = Instant::now();
+    let timeout = Duration::from_secs(1);
+    let mut found = false;
+    loop {
+        let mut pos = 0;
+        while recv.data.len() >= pos + 8 {
+            let (obj_id, length, op) = parse_wl_header(&recv.data[pos..]);
+            if obj_id == ObjId(u32::MAX) && op == 0 {
+                recv.data.truncate(pos);
+                return (recv.data, true);
+            }
+            if recv.data.len() < pos + length {
+                break;
+            }
+            found |= obj_id == obj && MethodId::Request(op) == opcode;
+            pos += length;
+        }
+        if found && pos == recv.data.len() {
+            return (recv.data, false);
+        }
+        let elapsed = Instant::now().duration_since(start);
+        assert!(elapsed < timeout, "timeout: {:?}", elapsed);
+        assert!(!recv.eof, "connection closed");
+        let mut pfds = [poll::PollFd::new(socket.as_fd(), poll::PollFlags::POLLIN)];
+        let remaining = time::TimeSpec::from_duration(timeout.saturating_sub(elapsed));
+        if let Err(e) = nix::poll::ppoll(&mut pfds, Some(remaining), None) {
+            assert!(e == Errno::EINTR || e == Errno::EAGAIN);
+        }
+        if pfds[0].revents().unwrap().contains(poll::PollFlags::POLLIN) {
+            recv.eof = test_read_from_socket(socket.as_fd(), &mut recv);
+        }
+    }
+}
+
+/** Test that a commit damaging a destroyed `wl_buffer` still attached to its surface causes no
+ * error when the compositor deletes the buffer at once: the compositor's side learns of the
+ * deletion before the program's side, so contents sent for the buffer would arrive after it. The
+ * destroy comes in the same write as the commit, or in an earlier one. */
+#[cfg(feature = "dmabuf")]
+fn proto_dmabuf_destroyed_attached(info: TestInfo, device: RenderDevice) -> TestResult {
+    let Ok(vulk) = setup_vulkan(device.id) else {
+        return Ok(StatusOk::Skipped);
+    };
+
+    run_protocol_test_with_drm_node(&info, &device, &|mut ctx: ProtocolTestContext| {
+        let (display, registry, dmabuf, comp, surface, feedback, params, buffer) = (
+            ObjId(1),
+            ObjId(2),
+            ObjId(3),
+            ObjId(4),
+            ObjId(5),
+            ObjId(6),
+            ObjId(7),
+            ObjId(8),
+        );
+
+        let supported_modifier_table = setup_linux_dmabuf(
+            &mut ctx, &vulk, display, registry, dmabuf, comp, surface, feedback,
+        );
+        let format = wayland_to_drm(WlShmFormat::Argb8888);
+        let Some(modifier_list) = supported_modifier_table.get(&format) else {
+            println!("Skipping test, format {:#08x} not supported", format);
+            return;
+        };
+        /* Large enough that sending the contents takes longer than a round trip */
+        let (w, h) = (2048_usize, 2048_usize);
+        for same_write in [true, false] {
+            /* A new buffer reusing the deleted one's id is replicated in full */
+            let mut base = vec![if same_write { 0x11 } else { 0x22 }; w * h * 4];
+            let (img, mirror) = create_dmabuf_and_copy(
+                &vulk,
+                &mut ctx,
+                params,
+                dmabuf,
+                buffer,
+                w,
+                h,
+                format,
+                modifier_list,
+                &base,
+            )
+            .unwrap();
+            ctx.prog_write_passthrough(build_msgs(|dst| {
+                write_req_wl_surface_attach(dst, surface, buffer, 0, 0);
+                write_req_wl_surface_damage_buffer(dst, surface, 0, 0, i32::MAX, i32::MAX);
+                write_req_wl_surface_commit(dst, surface);
+            }));
+            let tmp_rd = Arc::new(vulkan_get_buffer(&vulk, img.nominal_size(None), true).unwrap());
+            assert!(copy_from_dmabuf(&mirror, &tmp_rd).unwrap() == base);
+            if !same_write {
+                ctx.prog_write_passthrough(build_msgs(|dst| {
+                    write_req_zwp_linux_buffer_params_v1_destroy(dst, params);
+                    write_req_wl_buffer_destroy(dst, buffer);
+                }));
+            }
+
+            for (i, x) in base.iter_mut().enumerate() {
+                *x = (i % 251) as u8;
+            }
+            let tmp_wr = Arc::new(vulkan_get_buffer(&vulk, img.nominal_size(None), false).unwrap());
+            copy_onto_dmabuf(&img, &tmp_wr, &base).unwrap();
+
+            /* The program commits before it reads the compositor's deletion of the buffer */
+            let msg = build_msgs(|dst| {
+                write_req_wl_surface_damage_buffer(dst, surface, 0, 0, i32::MAX, i32::MAX);
+                if same_write {
+                    write_req_zwp_linux_buffer_params_v1_destroy(dst, params);
+                    write_req_wl_buffer_destroy(dst, buffer);
+                }
+                write_req_wl_surface_commit(dst, surface);
+            });
+            test_write_msgs(&ctx.sock_prog, &msg, &[]);
+            /* The compositor deletes the buffer as soon as it sees the destroy */
+            let (mut recvd, end) = if same_write {
+                test_read_until_msg(&ctx.sock_comp, buffer, OPCODE_WL_BUFFER_DESTROY)
+            } else {
+                (Vec::new(), false)
+            };
+            let delete = build_msgs(|dst| {
+                write_evt_wl_display_delete_id(dst, display, params.0);
+                write_evt_wl_display_delete_id(dst, display, buffer.0);
+            });
+            test_write_msgs(&ctx.sock_comp, &delete, &[]);
+
+            let (pmsg, pfds, perr) = test_read_msgs(&ctx.sock_prog, None);
+            assert!(perr.is_none(), "{:?}", perr);
+            assert!(pfds.is_empty());
+            assert!(pmsg.concat() == delete);
+            if !end {
+                let (rmsg, rfds, err) = test_read_msgs(&ctx.sock_comp, Some(&ctx.sock_prog));
+                assert!(err.is_none(), "{:?}", err);
+                assert!(rfds.is_empty());
+                recvd.extend_from_slice(&rmsg.concat());
+            }
+            assert!(recvd == msg);
+        }
+    })?;
+    Ok(StatusOk::Pass)
+}
+
 /** Test to verify the damage is correctly calculated (or at least, overestimated)
  * when using wp_viewport together with wl_surface.damage */
 fn proto_viewporter_damage(info: TestInfo) -> TestResult {
@@ -5297,6 +5447,13 @@ fn main() -> ExitCode {
     {
         register_per_device(t, &f, &vk_device_ids, "dmabuf", proto_dmabuf);
         register_per_device(t, &f, &vk_device_ids, "dmabuf_damage", proto_dmabuf_damage);
+        register_per_device(
+            t,
+            &f,
+            &vk_device_ids,
+            "dmabuf_destroyed_attached",
+            proto_dmabuf_destroyed_attached,
+        );
         register_per_device(
             t,
             &f,

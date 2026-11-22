@@ -133,6 +133,9 @@ pub struct Globals<'a> {
     // and extended objects (which include a Box)
     /** All Wayland objects that are being tracked */
     pub objects: BTreeMap<ObjId, WpObject>,
+    /** The wl_buffers the program has destroyed, which stay in `objects` until the compositor's
+     * wl_display.delete_id */
+    pub destroyed_buffers: BTreeSet<ObjId>,
     /** Counter to distinguish buffer objects, because ObjIds can be recycled */
     pub max_buffer_uid: u64,
     /** The clock id given by wp_presentation. This is guaranteed to never change for a
@@ -6010,6 +6013,7 @@ pub fn main_interface_loop(
         },
         max_local_id: if on_display_side { -1 } else { 1 },
         objects: setup_object_map(),
+        destroyed_buffers: BTreeSet::new(),
         max_buffer_uid: 1, /* Start at 1 to ensure 0 is never valid */
         presentation_clock: None,
         advertised_modifiers: BTreeMap::new(),

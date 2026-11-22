@@ -1107,6 +1107,13 @@ fn default_proc_way_msg(
             glob.objects.remove(&object_id).unwrap();
         } else {
             // client object, destructor request: wait until: wl_display.delete_id
+            if glob
+                .objects
+                .get(&object_id)
+                .is_some_and(|x| matches!(x.obj_type, WaylandInterface::WlBuffer))
+            {
+                glob.destroyed_buffers.insert(object_id);
+            }
         }
     }
     copy_msg(msg, dst);
@@ -1602,6 +1609,7 @@ pub fn process_way_msg(
                 return Err(tag!("Tried to delete wl_display object"));
             }
 
+            glob.destroyed_buffers.remove(&object_id);
             if let Some(_removed) = glob.objects.remove(&object_id) {
                 /* Cleanup .extra state: currently nothing to do */
             } else {
@@ -2109,8 +2117,18 @@ pub fn process_way_msg(
                  * destroyed and a new one with the same id is recreated; however,
                  * this is client misbehavior and Waypipe can silently ignore it,
                  * apply extra damage to the new buffer, and let the compositor
-                 * handle it. */
-                if let Some(buf) = glob.objects.get(&buf_id) {
+                 * handle it.
+                 *
+                 * A buffer the program destroyed gets no new contents: the protocol lets the
+                 * program change its storage only at the cost of undefined surface contents,
+                 * and the other Waypipe instance may already have dropped it, once the
+                 * compositor's wl_display.delete_id for it reached that instance first. */
+                let live_buf = if glob.destroyed_buffers.contains(&buf_id) {
+                    None
+                } else {
+                    glob.objects.get(&buf_id)
+                };
+                if let Some(buf) = live_buf {
                     let obj = &glob.objects.get(&object_id).unwrap();
                     let WpExtra::WlSurface(ref x) = &obj.extra else {
                         return Err(tag!(

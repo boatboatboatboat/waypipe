@@ -113,6 +113,8 @@ mod proto {
     #[cfg(feature = "dmabuf")]
     define_test! {dmabuf_damage}
     #[cfg(feature = "dmabuf")]
+    define_test! {dmabuf_destroyed_attached}
+    #[cfg(feature = "dmabuf")]
     define_test! {dmabuf_feedback_table}
     #[cfg(feature = "dmabuf")]
     define_test! {dmabuf_pre_v4}

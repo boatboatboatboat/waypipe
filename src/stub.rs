@@ -356,6 +356,15 @@ mod video_stub {
     ) -> bool {
         false
     }
+    pub fn supports_video_decode(
+        vulk: &VulkanDevice,
+        fmt: VideoFormat,
+        drm_format: u32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        false
+    }
     impl VulkanDecodeOpHandle {
         pub fn get_timeline_point(&self) -> u64 {
             unreachable!();

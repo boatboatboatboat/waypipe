@@ -302,10 +302,12 @@ fn build_connection_command<'a>(
         SocketSpec::VSock(x) => strings.push(format!("{}", x).into()),
         SocketSpec::Unix(x) => strings.push(x.into()),
     };
+    strings.push(OsString::from(options.frame_rate.to_string()));
     let comp_str = &strings[0];
     let thread_str = &strings[1];
     let vid_str = &strings[2];
     let socket_str = &strings[3];
+    let frame_rate_str = &strings[4];
 
     /* Unlike the parent process, use short option names for these, making the command
      * line shorter and easier to skim */
@@ -330,6 +332,14 @@ fn build_connection_command<'a>(
     }
     if options.video.format.is_some() {
         args.push(vid_str);
+    }
+    if options.frame_rate > 0 && !client {
+        args.push(OsStr::new("--frame-rate"));
+        args.push(frame_rate_str);
+    }
+    if let (Some(p), false) = (&options.frame_time_file, client) {
+        args.push(OsStr::new("--frame-time-file"));
+        args.push(p.as_os_str());
     }
     if let Some(d) = &options.drm_node {
         assert!(!client);
@@ -1991,6 +2001,112 @@ pub const VERSION_STRING: &str = match option_env!("WAYPIPE_VERSION") {
     None => VERSION_STRING_CARGO,
 };
 
+/** A running waypipe-audio, told to end when this is dropped; it also ends if this process dies */
+struct AudioHelper(Child);
+
+impl Drop for AudioHelper {
+    fn drop(&mut self) {
+        let pid = nix::unistd::Pid::from_raw(self.0.id() as i32);
+        let _ = signal::kill(pid, signal::Signal::SIGTERM);
+        let _ = self.0.wait();
+    }
+}
+
+/** waypipe-audio beside this executable, as installed, or else from PATH */
+fn audio_helper_command() -> std::process::Command {
+    let beside = env::current_exe()
+        .ok()
+        .and_then(|p| Some(p.parent()?.join("waypipe-audio")))
+        .filter(|p| p.exists());
+    std::process::Command::new(beside.unwrap_or_else(|| PathBuf::from("waypipe-audio")))
+}
+
+/** A UDP port with its next two free now, for --audio; None gives no sound, with a warning */
+fn pick_audio_port() -> Option<u16> {
+    for _ in 0..20 {
+        let Ok(first) = std::net::UdpSocket::bind(("0.0.0.0", 0)) else {
+            continue;
+        };
+        let Ok(addr) = first.local_addr() else {
+            continue;
+        };
+        let port = addr.port();
+        if port < u16::MAX - 2
+            && std::net::UdpSocket::bind(("0.0.0.0", port + 1)).is_ok()
+            && std::net::UdpSocket::bind(("0.0.0.0", port + 2)).is_ok()
+        {
+            return Some(port);
+        }
+    }
+    eprintln!("waypipe: no free UDP ports for --audio; no sound");
+    None
+}
+
+/** Start playing sound arriving on `port`; a failure costs only the sound */
+fn start_audio_receiver(port: u16) -> Option<AudioHelper> {
+    match audio_helper_command()
+        .arg("recv")
+        .arg(port.to_string())
+        .spawn()
+    {
+        Ok(child) => Some(AudioHelper(child)),
+        Err(e) => {
+            eprintln!("waypipe: could not run waypipe-audio: {}; no sound", e);
+            None
+        }
+    }
+}
+
+/** Start sending a null sink's sound to the machine this ssh session came from, and direct
+ * programs started from here to it through PULSE_SINK. Returns the helper and, with
+ * `report_frames`, where the frame time should go: `given`, or a file for this run. A failure
+ * costs only the sound. */
+fn start_audio_sender(
+    port: u16,
+    report_frames: bool,
+    given: Option<PathBuf>,
+) -> Option<(AudioHelper, Option<PathBuf>)> {
+    let connection = env::var("SSH_CONNECTION").ok();
+    let Some(host) = connection.as_deref().and_then(|c| c.split(' ').next()) else {
+        eprintln!("waypipe: SSH_CONNECTION is not set, so --audio has no destination; no sound");
+        return None;
+    };
+    let path = report_frames.then(|| {
+        given.unwrap_or_else(|| {
+            env::var_os("XDG_RUNTIME_DIR")
+                .map_or_else(env::temp_dir, PathBuf::from)
+                .join(format!("waypipe-audio-{}.frame-time", std::process::id()))
+        })
+    });
+    let mut command = audio_helper_command();
+    command
+        .arg("send")
+        .arg(host)
+        .arg(port.to_string())
+        .stdout(std::process::Stdio::piped());
+    if let Some(p) = &path {
+        command.arg(p);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("waypipe: could not run waypipe-audio: {}; no sound", e);
+            return None;
+        }
+    };
+    let mut sink = String::new();
+    let stdout = child.stdout.take()?;
+    let read = std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut sink);
+    let helper = AudioHelper(child);
+    if read.is_err() || sink.trim().is_empty() {
+        /* The helper has said why on stderr */
+        return None;
+    }
+    /* Only this thread runs yet, and the program started later inherits it */
+    env::set_var("PULSE_SINK", sink.trim());
+    Some((helper, path))
+}
+
 /** Main entrypoint */
 fn main() -> Result<ExitCode, String> {
     let command = Command::new(env!("CARGO_PKG_NAME"))
@@ -2139,6 +2255,52 @@ fn main() -> Result<ExitCode, String> {
                 .help("Number of worker threads to use: 0 ⇒ hardware threads/2")
                 .value_parser(value_parser!(u32))
                 .default_value("0"),
+        )
+        .arg(
+            Arg::new("frame-rate")
+                .long("frame-rate")
+                .value_name("fps")
+                .help(
+                    "server: Answer the program's frame callbacks locally, at most this many \
+                     times a second and only once the previous frame has been sent, and EGL's \
+                     per-frame syncs and its buffer releases once its commits are captured, \
+                     instead of waiting a round trip for the compositor; 0 ⇒ wait for the \
+                     compositor",
+                )
+                .value_parser(value_parser!(u32))
+                .default_value("0"),
+        )
+        .arg(
+            Arg::new("audio")
+                .long("audio")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "ssh: Carry the program's sound too, as Opus in RTP over UDP beside Waypipe's \
+                     stream, played in line with the picture. Needs GStreamer's Python bindings \
+                     on both ends, pactl on the remote one, this option in the remote Waypipe, \
+                     and a UDP route from there to the IPv4 address in SSH_CONNECTION",
+                ),
+        )
+        .arg(
+            Arg::new("audio-port")
+                .long("audio-port")
+                .value_name("port")
+                .help(
+                    "client, server: As --audio, for each end started separately. The ports from \
+                     this one to this one + 2 carry it; give both ends the same value",
+                )
+                .value_parser(value_parser!(u16)),
+        )
+        .arg(
+            Arg::new("frame-time-file")
+                .long("frame-time-file")
+                .value_name("path")
+                .help(
+                    "server, with --frame-rate: Keep in this file the recent median time, in \
+                     milliseconds, from a frame's commit to the compositor's answer returning, \
+                     so another program can line up with how late frames show",
+                )
+                .value_parser(value_parser!(PathBuf)),
         )
         .arg(
             Arg::new("title-prefix")
@@ -2298,6 +2460,7 @@ fn main() -> Result<ExitCode, String> {
     let title_prefix = matches.get_one::<String>("title-prefix").unwrap();
     let display = matches.get_one::<PathBuf>("display");
     let threads = matches.get_one::<u32>("threads").unwrap();
+    let frame_rate = *matches.get_one::<u32>("frame-rate").unwrap();
     let unlink = *matches.get_one::<bool>("unlink-socket").unwrap();
     let mut compression: Compression = *matches.get_one::<Compression>("compress").unwrap();
     let mut video: VideoSetting = *matches.get_one::<VideoSetting>("video").unwrap();
@@ -2382,12 +2545,28 @@ fn main() -> Result<ExitCode, String> {
         }
     }
 
+    let audio_port: Option<u16> = matches.get_one::<u16>("audio-port").copied();
+    let audio = *matches.get_one::<bool>("audio").unwrap();
+    /* Lives until main returns: its helper removes what it made when this ends */
+    let mut _audio_helper: Option<AudioHelper> = None;
+    let mut frame_time_file = matches.get_one::<PathBuf>("frame-time-file").cloned();
+    if let (Some(port), Some(("server", _))) = (audio_port, matches.subcommand()) {
+        if let Some((helper, path)) =
+            start_audio_sender(port, frame_rate > 0, frame_time_file.clone())
+        {
+            _audio_helper = Some(helper);
+            frame_time_file = path;
+        }
+    }
+
     let opts = Options {
         debug: *debug,
         no_gpu: *no_gpu || cfg!(not(any(feature = "dmabuf", feature = "gbmfallback"))),
         compression,
         video,
         threads: *threads,
+        frame_rate,
+        frame_time_file,
         title_prefix: (*title_prefix).clone(),
         drm_node: drm_node.cloned(),
         test_skip_vulkan,
@@ -2422,6 +2601,9 @@ fn main() -> Result<ExitCode, String> {
     match matches.subcommand() {
         Some(("ssh", submatch)) => {
             debug!("Starting client+ssh main process");
+            let picked_port = if audio { pick_audio_port() } else { audio_port };
+            let _audio_receiver = picked_port.and_then(start_audio_receiver);
+            let arg_audio_port = picked_port.map(|p| OsString::from(p.to_string()));
             let subargs = submatch.get_raw("ssh_args");
             let ssh_args: Vec<&std::ffi::OsStr> = subargs.unwrap_or_default().collect();
             let (destination_idx, _) = locate_openssh_cmd_hostname(&ssh_args)?;
@@ -2503,10 +2685,19 @@ fn main() -> Result<ExitCode, String> {
             if opts.no_gpu {
                 ssh_cmd.push(OsStr::new("--no-gpu"));
             }
+            if let Some(p) = &arg_audio_port {
+                ssh_cmd.push(OsStr::new("--audio-port"));
+                ssh_cmd.push(p);
+            }
             ssh_cmd.push(OsStr::new("--unlink-socket"));
             ssh_cmd.push(OsStr::new("--threads"));
             let arg_nthreads = OsString::from(opts.threads.to_string());
             ssh_cmd.push(&arg_nthreads);
+            let arg_frame_rate = OsString::from(opts.frame_rate.to_string());
+            if opts.frame_rate > 0 {
+                ssh_cmd.push(OsStr::new("--frame-rate"));
+                ssh_cmd.push(&arg_frame_rate);
+            }
 
             let arg_drm_node_val;
             if let Some(r) = remote_node {
@@ -2560,6 +2751,7 @@ fn main() -> Result<ExitCode, String> {
         }
         Some(("client", _submatch)) => {
             debug!("Starting client main process");
+            let _audio_receiver = audio_port.and_then(start_audio_receiver);
             let socket_path: SocketSpec = client_socket
                 .unwrap_or(SocketSpec::Unix(PathBuf::from("/tmp/waypipe-client.sock")));
 

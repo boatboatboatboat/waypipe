@@ -1,0 +1,438 @@
+#!/usr/bin/python3
+"""Sound for a program shown through Waypipe, kept level with its picture by feedback.
+
+Waypipe runs this for --audio. Sound travels beside Waypipe's stream, as Opus in RTP over UDP, since
+over a stream that retransmits a stall becomes a backlog that delays everything after it.
+
+No frame is held and no offset is assumed. Three things are measured all the time:
+- the picture's delay: waypipe's server reports the time from a frame's commit to the compositor's
+  answer (--frame-time-file), of which half a round trip is the answer's way back;
+- the link: round trips and the two clocks' difference, by probes the receiver answers;
+- the sound's delay: the latency the GStreamer pipelines themselves report, with the jitter buffer's
+  T in it, corrected by the clocks' difference, since rtpbin plays a sample at its capture time on the
+  sender's clock plus T, on the receiver's clock.
+
+The receiver's jitter buffer is the one delay that has to exist, and T is the one control. A controller
+moves T toward making the two delays equal, down to a floor set by the measured jitter and raised
+whenever packets do come too late. Where the floor stops it, sound stays later than the picture by
+what is left, and the receiver says so.
+
+recv PORT [SINK]: on the display's machine. Answers probes on PORT+2 and plays what arrives.
+send HOST PORT [FRAME_TIME_FILE]: on the program's machine. Makes a null sink for the program and prints
+its name on stdout, then measures and reports. The sender measures because a display machine on a
+userspace Tailscale can only answer UDP, never start it.
+
+Both exit when their parent does, removing what they made, however the parent ended.
+
+Needs GStreamer's Python bindings and its Opus, RTP and PulseAudio plugins, and pactl for send, on IPv4;
+the system's Python holds the bindings, hence the path above. Exits nonzero with one line on
+stderr when it can't run; the caller's window goes on without sound.
+"""
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+# The controller's own terms, which set how it moves and hold no fact about a machine.
+GAIN = 0.5  # A step corrects half the error: no overshoot past a noisy reading, level in seconds.
+DEADBAND_MS = 8.0  # About the measured spread of one reading; each change of T can click.
+BOOST_DECAY = 0.98  # Per tick: half of a raised floor is gone after about half a minute.
+TICK_S = 1.0  # waypipe rewrites the frame time this often.
+T_CEILING_MS = 500.0  # A delay beyond this is unusable, whatever the picture does.
+NO_MEASURE_T_MS = 100.0  # Only until the first probes answer, or with none at all.
+PROBE_INTERVAL_S = 0.25
+PROBE_WINDOW = 40
+FIRST_PROBES = 12
+FIRST_PROBE_WAIT_S = 1.5
+NO_SENDER_WARNING_S = 10.0
+RTP_CAPS = "application/x-rtp,media=audio,clock-rate=48000,encoding-name=OPUS,payload=96"
+
+
+def percentile(values: list[float], q: float) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+
+
+def jitter_floor_ms(round_trips_ms: list[float], late_boost_ms: float) -> float:
+    """The least T with packets on time: a slow packet's way here, and what late packets taught."""
+    if not round_trips_ms:
+        return NO_MEASURE_T_MS
+    median = percentile(round_trips_ms, 0.5)
+    slow = percentile(round_trips_ms, 0.9)
+    return median / 2 + (slow - median) + late_boost_ms
+
+
+def next_boost_ms(boost_ms: float, new_late: float, jitter_ms: float) -> float:
+    """Raise the floor at once when packets come too late, and let it down slowly while none do,
+    so that one bad moment on the link doesn't cost sync for the rest of the run."""
+    if new_late > 0:
+        return boost_ms + jitter_ms + 1.0
+    return boost_ms * BOOST_DECAY
+
+
+def picture_delay_ms(frame_time_ms: float, round_trip_ms: float) -> float:
+    """A frame's time from commit to shown: the reported time less the answer's way back."""
+    return max(0.0, frame_time_ms - round_trip_ms / 2)
+
+
+def sound_delay_ms(t_ms: float, receive_extra_ms: float, capture_ms: float, offset_ms: float) -> float:
+    """A sample's time from capture to output. offset_ms is the receiver's clock less the sender's."""
+    return t_ms + receive_extra_ms + capture_ms - offset_ms
+
+
+def next_t_ms(t_ms: float, error_ms: float, floor_ms: float) -> float:
+    """The next T for this error (picture delay less sound delay)."""
+    target = t_ms if abs(error_ms) <= DEADBAND_MS else t_ms + GAIN * error_ms
+    return min(T_CEILING_MS, max(floor_ms, target))
+
+
+def clock_offset_ms(sent: float, answered_at: float, received: float) -> float:
+    """The answering machine's clock less this one's, from one exchange (wall clocks, seconds)."""
+    return (answered_at - (sent + received) / 2) * 1000
+
+
+def parse_report(data: bytes) -> dict[str, float] | None:
+    """A sender's report (`R key=value ...`), or None for anything else on the port."""
+    if not data.startswith(b"R "):
+        return None
+    report: dict[str, float] = {}
+    try:
+        for item in data[2:].decode().split():
+            key, value = item.split("=")
+            report[key] = float(value)
+    except ValueError:
+        return None
+    return report
+
+
+def read_frame_time_ms(path: str) -> float | None:
+    try:
+        with open(path) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+class Probes:
+    """Round trips and the clocks' difference, from probes the receiver echoes."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.connect((host, port + 2))
+        self.sock.settimeout(0.05)
+        self.sent: dict[int, tuple[float, float]] = {}
+        self.trips: list[float] = []
+        self.offsets: list[tuple[float, float]] = []
+        self.count = 0
+
+    def send_probe(self) -> None:
+        self.sent[self.count] = (time.monotonic(), time.time())
+        try:
+            self.sock.send(b"p%d" % self.count)
+        except OSError:
+            pass
+        self.count += 1
+
+    def collect(self, until: float) -> None:
+        while (left := until - time.monotonic()) > 0:
+            self.sock.settimeout(left)
+            try:
+                data = self.sock.recv(128)
+            except (TimeoutError, OSError):
+                continue
+            parts = data.split()
+            if len(parts) != 2 or not parts[0].startswith(b"p"):
+                continue
+            sent = self.sent.pop(int(parts[0][1:]), None)
+            if sent is None:
+                continue
+            trip = (time.monotonic() - sent[0]) * 1000
+            self.trips = (self.trips + [trip])[-PROBE_WINDOW:]
+            self.offsets = (self.offsets + [(trip, clock_offset_ms(sent[1], float(parts[1]), time.time()))])[-PROBE_WINDOW:]
+
+    def offset_ms(self) -> float:
+        """From the fastest exchanges, the ones least skewed by a one-way queue."""
+        if not self.offsets:
+            return 0.0
+        return min(self.offsets)[1]
+
+    def send_report(self, **values: float) -> None:
+        text = " ".join(f"{k}={v:.1f}" for k, v in values.items())
+        try:
+            self.sock.send(f"R {text}".encode())
+        except OSError:
+            pass
+
+
+def sender_pipeline(source: str, host: str, port: int) -> str:
+    return (
+        "rtpbin name=rtp rtcp-sync-send-time=false "
+        f"pulsesrc name=capture device={source} buffer-time=100000 latency-time=10000 provide-clock=false "
+        "! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 "
+        "! opusenc bitrate=64000 frame-size=10 audio-type=restricted-lowdelay "
+        "! rtpopuspay pt=96 ! rtp.send_rtp_sink_0 "
+        f"rtp.send_rtp_src_0 ! udpsink host={host} port={port} "
+        f"rtp.send_rtcp_src_0 ! udpsink host={host} port={port + 1} sync=false async=false"
+    )
+
+
+def receiver_pipeline(sink: str, port: int, t_ms: float) -> str:
+    device = f"device={sink} " if sink else ""
+    return (
+        f"rtpbin name=rtp ntp-sync=true latency={round(t_ms)} buffer-mode=synced "
+        f'udpsrc port={port} caps="{RTP_CAPS}" ! rtp.recv_rtp_sink_0 '
+        f"udpsrc port={port + 1} caps=application/x-rtcp ! rtp.recv_rtcp_sink_0 "
+        "rtp. ! rtpopusdepay ! opusdec plc=true ! audioconvert ! audioresample "
+        f"! pulsesink name=output {device}buffer-time=100000 latency-time=10000 provide-clock=false"
+    )
+
+
+class Pipeline:
+    def __init__(self, description: str) -> None:
+        import gi
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import GLib, Gst
+
+        self.Gst = Gst
+        self.GLib = GLib
+        Gst.init(None)
+        self.pipeline = Gst.parse_launch(description)
+        self.loop = GLib.MainLoop()
+        self.status = 0
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_message)
+
+    def _on_message(self, _bus, msg) -> None:
+        if msg.type == self.Gst.MessageType.ERROR:
+            err, _debug = msg.parse_error()
+            print(f"waypipe-audio: {err.message}", file=sys.stderr, flush=True)
+            self.status = 1
+            self.loop.quit()
+        elif msg.type == self.Gst.MessageType.LATENCY:
+            self.pipeline.recalculate_latency()
+
+    def latency_ms(self) -> float | None:
+        """The pipeline's own latency, or None until it is playing."""
+        query = self.Gst.Query.new_latency()
+        if not self.pipeline.query(query):
+            return None
+        live, minimum, _maximum = query.parse_latency()
+        return minimum / 1e6 if live else None
+
+    def every(self, seconds: float, callback) -> None:
+        def tick() -> bool:
+            callback()
+            return True
+
+        self.GLib.timeout_add(int(seconds * 1000), tick)
+
+    def run(self) -> int:
+        self.pipeline.set_state(self.Gst.State.PLAYING)
+        try:
+            self.loop.run()
+        except KeyboardInterrupt:
+            pass
+        self.pipeline.set_state(self.Gst.State.NULL)
+        return self.status
+
+
+def recv(port: int, sink: str) -> int:
+    latest: dict[str, float] = {}
+    lock = threading.Lock()
+    started = threading.Event()
+
+    def answer() -> None:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", port + 2))
+        while True:
+            data, addr = s.recvfrom(256)
+            if data.startswith(b"p"):
+                s.sendto(data + b" %.6f" % time.time(), addr)
+                continue
+            report = parse_report(data)
+            if report is not None:
+                with lock:
+                    latest.update(report)
+                started.set()
+
+    threading.Thread(target=answer, daemon=True).start()
+    if not started.wait(NO_SENDER_WARNING_S):
+        print(
+            "waypipe-audio: nothing from the sender yet: no sound until it arrives "
+            "(a route blocking UDP?)",
+            file=sys.stderr,
+            flush=True,
+        )
+        started.wait()
+    with lock:
+        t_ms = max(latest.get("floor", NO_MEASURE_T_MS), latest.get("rtt", NO_MEASURE_T_MS))
+    pipe = Pipeline(receiver_pipeline(sink, port, t_ms))
+    rtpbin = pipe.pipeline.get_by_name("rtp")
+    jitter_buffers = []
+    rtpbin.connect("new-jitterbuffer", lambda _b, jb, _session, _ssrc: jitter_buffers.append(jb))
+    state = {"t": t_ms, "late": 0.0, "boost": None}
+
+    def control() -> None:
+        with lock:
+            report = dict(latest)
+        total = pipe.latency_ms()
+        if total is None or "picture" not in report or "capture" not in report:
+            return
+        late = sum(jb.get_property("stats").get_value("num-late") for jb in jitter_buffers)
+        if state["boost"] is None:
+            state["boost"] = report.get("jitter", 0.0)
+        new_late = late - state["late"]
+        state["boost"] = next_boost_ms(state["boost"], new_late, report.get("jitter", 0.0))
+        state["late"] = late
+        floor = report.get("rtt", NO_MEASURE_T_MS) / 2 + state["boost"]
+        receive_extra = total - state["t"]
+        sound = sound_delay_ms(state["t"], receive_extra, report["capture"], report.get("offset", 0.0))
+        error = report["picture"] - sound
+        t_new = next_t_ms(state["t"], error, floor)
+        if round(t_new) != round(state["t"]):
+            state["t"] = t_new
+            rtpbin.set_property("latency", round(t_new))
+        # Only what the user can act on: the error above reads high by an unmeasured amount, since
+        # it can't see all of the picture's path, so it is no gap to report. WAYPIPE_AUDIO_DEBUG
+        # prints the controller's state each tick.
+        if new_late > 0 or os.environ.get("WAYPIPE_AUDIO_DEBUG"):
+            print(
+                f"waypipe-audio: {new_late:.0f} packets too late, T now {state['t']:.0f} ms; picture "
+                f"{report['picture']:.0f} ms, sound {sound:.0f} ms (receive extra {receive_extra:.0f}, "
+                f"capture {report['capture']:.0f}, offset {report.get('offset', 0.0):.0f}), floor {floor:.0f} ms",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    pipe.every(TICK_S, control)
+    return pipe.run()
+
+
+def send(probes: Probes, pipe: Pipeline, frame_time_file: str) -> int:
+    for _ in range(FIRST_PROBES):
+        probes.send_probe()
+        probes.collect(time.monotonic() + 0.02)
+    probes.collect(time.monotonic() + FIRST_PROBE_WAIT_S)
+    print(f"waypipe-audio: {len(probes.trips)} of {FIRST_PROBES} probes answered", file=sys.stderr, flush=True)
+
+    def report_first() -> None:
+        if probes.trips:
+            median = percentile(probes.trips, 0.5)
+            probes.send_report(rtt=median, floor=jitter_floor_ms(probes.trips, 0.0))
+        else:
+            probes.send_report(rtt=NO_MEASURE_T_MS, floor=NO_MEASURE_T_MS)
+
+    report_first()
+    stop = threading.Event()
+
+    def measure() -> None:
+        while not stop.is_set():
+            probes.send_probe()
+            probes.collect(time.monotonic() + PROBE_INTERVAL_S)
+
+    threading.Thread(target=measure, daemon=True).start()
+
+    def report() -> None:
+        capture = pipe.latency_ms()
+        values = {"offset": probes.offset_ms()}
+        if probes.trips:
+            median = percentile(probes.trips, 0.5)
+            values.update(
+                rtt=median,
+                floor=jitter_floor_ms(probes.trips, 0.0),
+                jitter=percentile(probes.trips, 0.9) - median,
+            )
+            frame_time = read_frame_time_ms(frame_time_file) if frame_time_file else None
+            if frame_time is not None:
+                values["picture"] = picture_delay_ms(frame_time, median)
+        if capture is not None:
+            values["capture"] = capture
+        probes.send_report(**values)
+
+    pipe.every(TICK_S, report)
+    status = pipe.run()
+    stop.set()
+    return status
+
+
+CLEANUPS: list = []
+
+
+def clean_up() -> None:
+    while CLEANUPS:
+        try:
+            CLEANUPS.pop()()
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def exit_with_parent() -> None:
+    """End on SIGTERM or when the parent is gone, its sink unloaded even after a parent's SIGKILL."""
+
+    def on_term(_signum, _frame) -> None:
+        clean_up()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    parent = os.getppid()
+
+    def watch() -> None:
+        while os.getppid() == parent:
+            time.sleep(0.5)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
+def make_sink() -> str:
+    """A null sink for this run, which never becomes the machine's default: zero priorities."""
+    name = f"waypipe_audio_{os.getpid()}"  # The sender's pipeline names its monitor from this too.
+    module = subprocess.run(
+        ["pactl", "load-module", "module-null-sink", f"sink_name={name}",
+         "sink_properties=priority.session=0 priority.driver=0 node.dont-fallback=true"],
+        capture_output=True, text=True, check=True, timeout=10,
+    ).stdout.strip()
+    CLEANUPS.append(lambda: subprocess.run(["pactl", "unload-module", module], capture_output=True, timeout=10))
+    return name
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    exit_with_parent()
+    try:
+        if args[:1] == ["recv"] and len(args) in (2, 3):
+            return recv(int(args[1]), args[2] if len(args) == 3 else os.environ.get("WAYPIPE_AUDIO_SINK", ""))
+        if args[:1] == ["send"] and len(args) in (3, 4):
+            import gi  # noqa: F401 Before the sink: with no bindings, the program keeps its own output.
+
+            frame_time_file = args[3] if len(args) == 4 else ""
+            # A file Waypipe chose goes with the run; a name the user gave stays theirs.
+            if os.path.basename(frame_time_file).startswith("waypipe-audio-"):
+                CLEANUPS.append(lambda: os.unlink(frame_time_file))
+            # Everything that can fail on its own comes before the sink is named: once it is, the
+            # program plays into it.
+            probes = Probes(args[1], int(args[2]))
+            pipe = Pipeline(sender_pipeline(f"waypipe_audio_{os.getpid()}.monitor", args[1], int(args[2])))
+            sink = make_sink()
+            print(sink, flush=True)
+            return send(probes, pipe, frame_time_file)
+    except ImportError as e:
+        print(f"waypipe-audio: no GStreamer bindings ({e}): no sound", file=sys.stderr)
+        return 1
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"waypipe-audio: can't send sound ({e}): no sound", file=sys.stderr)
+        return 1
+    finally:
+        clean_up()
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -13,7 +13,7 @@ waypipe - A transparent proxy for Wayland applications
 *waypipe* *bench*++
 *waypipe* [*--version*] [*-h*, *--help*]
 
-\[options...\] = [*-c*, *--compress* C] [*-d*, *--debug*] [*-n*, *--no-gpu*] [*-o*, *--oneshot*] [*-s*, *--socket* S] [*--display* D] [*--drm-node* R] [*--remote-node* R] [*--ssh-bin R*] [*--remote-bin* R] [*--remote-socket* S] [*--login-shell*] [*--threads* T] [*--title-prefix* P] [*--unlink-socket*] [*--video* V] [*--vsock*] [*--secctx S*] [*--xwls*]
+\[options...\] = [*-c*, *--compress* C] [*-d*, *--debug*] [*-n*, *--no-gpu*] [*-o*, *--oneshot*] [*-s*, *--socket* S] [*--display* D] [*--drm-node* R] [*--frame-rate* F] [*--remote-node* R] [*--ssh-bin R*] [*--remote-bin* R] [*--remote-socket* S] [*--login-shell*] [*--threads* T] [*--title-prefix* P] [*--unlink-socket*] [*--video* V] [*--vsock*] [*--secctx S*] [*--xwls*]
 
 
 
@@ -94,6 +94,48 @@ compressible as images containing pictures.
 *--drm-node R*
 	Specify the path *R* to the drm device that this instance of waypipe should
 	use and (in server mode) notify connecting applications about.
+
+*--audio*
+	For ssh mode: carry the application's sound as well. The remote end makes a
+	null sink for the run, points the application at it with _PULSE_SINK_, and
+	sends its sound as Opus in RTP over UDP to the machine in _SSH_CONNECTION_,
+	beside Waypipe's stream; this end plays it. With *--frame-rate*, the
+	receiver's jitter buffer is steered toward the frame time (see
+	*--frame-time-file*), down to half the measured round trip plus a margin
+	learned from late packets; no frame is delayed. Runs *waypipe-audio*, which
+	needs GStreamer's Python bindings on both ends and _pactl_ on the remote
+	one; if any of that fails, a message says so and the application runs with
+	no sound. The remote Waypipe must have this option too. The sound goes to
+	the IPv4 address in _SSH_CONNECTION_, which behind a jump host or NAT names
+	that hop, so the sound doesn't arrive there.
+
+*--audio-port P*
+	For client and server modes: as *--audio*, for each end started separately.
+	Ports *P* to *P* + 2 carry it. Give both ends the same value.
+
+*--frame-time-file PATH*
+	For server mode with *--frame-rate*: keep in _PATH_ the recent median time,
+	in milliseconds, from a frame's commit to the compositor's answer arriving.
+
+*--frame-rate F*
+	For server or ssh mode: answer an application's frame callbacks in the
+	server, at most *F* times a second and once the previous frame has been
+	sent, and release a buffer once a newer commit to its surface is captured,
+	instead of waiting a round trip for the compositor's answers. The local side
+	writes a buffer's next contents only once the compositor releases it, or
+	after 100 ms. A _wl_display.sync_ that
+	follows one or more requests, all giving new contents to surfaces already
+	showing a buffer (as EGL sends after each frame), is answered in the server
+	too, once those commits are captured. While a surface's oldest frame
+	callback, or the oldest sync, answered in the server has waited for the
+	compositor's answer 100 ms longer than the shortest recent round trip, that
+	surface's next callbacks, or the next syncs, wait too, until the
+	compositor's answers catch up. A surface
+	whose frame callback the compositor has held for over a second, as it does
+	for a hidden window, is left to the compositor until it answers. A buffer
+	with an explicit-sync release point (_wp_linux_drm_syncobj_v1_) is released
+	by that protocol alone. The default, _0_, waits for the
+	compositor.
 
 *--remote-node R*
 	In ssh mode, specify the path *R* to the drm device that the remote instance

@@ -41,13 +41,15 @@ use nix::sys::{memfd, signal, socket, time, uio};
 use nix::unistd;
 use std::cell::RefCell;
 use std::collections::{btree_map, BTreeMap, BTreeSet, VecDeque};
-use std::io::{IoSlice, IoSliceMut};
+use std::io::{self, IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::{fs::File, thread};
 
 /** Whether a message transfer direction is active, shutting down, or off.
  *
@@ -1356,6 +1358,167 @@ pub fn translate_pipe_fd(
     glob.pipes.push(sfd.clone());
 
     Ok(sfd)
+}
+
+fn finish_uri_list_remap_child(child: &Arc<Mutex<Child>>, result: io::Result<u64>) {
+    if let Err(error) = result {
+        error!("URI-list remapper stream failed: {}", error);
+        match child.lock() {
+            Ok(mut child) => {
+                if let Err(kill_error) = child.kill() {
+                    error!(
+                        "Failed to stop URI-list remapper after stream error: {}",
+                        kill_error
+                    );
+                }
+            }
+            Err(_) => error!("URI-list remapper process lock was poisoned"),
+        }
+    }
+
+    match child.lock() {
+        Ok(mut child) => match child.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => error!("URI-list remapper exited unsuccessfully: {}", status),
+            Err(error) => error!("Failed to wait for URI-list remapper: {}", error),
+        },
+        Err(_) => error!("URI-list remapper process lock was poisoned"),
+    }
+}
+
+fn uri_list_remap_direction(reading_from_channel: bool) -> &'static str {
+    if reading_from_channel {
+        "remote-to-local"
+    } else {
+        "local-to-remote"
+    }
+}
+
+fn spawn_uri_list_remap(
+    fd: OwnedFd,
+    program: &Path,
+    kind: &str,
+    direction: &str,
+    reading_from_channel: bool,
+) -> Result<OwnedFd, String> {
+    set_blocking(&fd)?;
+
+    let mut child = Command::new(program)
+        .arg(kind)
+        .arg(direction)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| tag!("Failed to start URI-list remapper {:?}: {}", program, error))?;
+
+    let Some(child_stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(tag!("URI-list remapper {:?} has no stdin pipe", program));
+    };
+    let Some(child_stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(tag!("URI-list remapper {:?} has no stdout pipe", program));
+    };
+
+    let (mainloop_fd, worker) = if reading_from_channel {
+        let mainloop_fd: OwnedFd = child_stdin.into();
+        let worker_stdout: OwnedFd = child_stdout.into();
+        if let Err(error) = set_nonblock(&mainloop_fd) {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        if let Err(error) = set_blocking(&worker_stdout) {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+
+        let mut destination = File::from(fd);
+        let mut source = File::from(worker_stdout);
+        (
+            mainloop_fd,
+            Box::new(move |child| {
+                let result = io::copy(&mut source, &mut destination);
+                finish_uri_list_remap_child(&child, result);
+            }) as Box<dyn FnOnce(Arc<Mutex<Child>>) + Send>,
+        )
+    } else {
+        let mainloop_fd: OwnedFd = child_stdout.into();
+        if let Err(error) = set_nonblock(&mainloop_fd) {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+
+        let mut source = File::from(fd);
+        let mut destination = child_stdin;
+        (
+            mainloop_fd,
+            Box::new(move |child| {
+                let result = io::copy(&mut source, &mut destination);
+                drop(destination);
+                finish_uri_list_remap_child(&child, result);
+            }) as Box<dyn FnOnce(Arc<Mutex<Child>>) + Send>,
+        )
+    };
+
+    let child = Arc::new(Mutex::new(child));
+    let worker_child = Arc::clone(&child);
+    match thread::Builder::new()
+        .name("waypipe-uri-list-remap".to_string())
+        .spawn(move || worker(worker_child))
+    {
+        Ok(handle) => drop(handle),
+        Err(error) => {
+            match child.lock() {
+                Ok(mut child) => {
+                    if let Err(kill_error) = child.kill() {
+                        error!(
+                            "Failed to stop URI-list remapper after worker error: {}",
+                            kill_error
+                        );
+                    }
+                    if let Err(wait_error) = child.wait() {
+                        error!(
+                            "Failed to wait for URI-list remapper after worker error: {}",
+                            wait_error
+                        );
+                    }
+                }
+                Err(_) => error!("URI-list remapper process lock was poisoned"),
+            }
+            return Err(tag!("Failed to start URI-list remapper worker: {}", error));
+        }
+    }
+
+    Ok(mainloop_fd)
+}
+
+/** Attach a streaming remapper to a pipe carrying text/uri-list data. */
+pub fn attach_uri_list_remap(
+    sfd: &Rc<RefCell<ShadowFd>>,
+    program: &Path,
+    kind: &str,
+) -> Result<(), String> {
+    let mut sfd = sfd.borrow_mut();
+    let ShadowFdVariant::Pipe(ref mut pipe) = sfd.data else {
+        return Err(tag!("Cannot transform a non-pipe file descriptor"));
+    };
+    let reading_from_channel = matches!(pipe.buf, ShadowFdPipeBuffer::ReadFromChannel(_));
+    let direction = uri_list_remap_direction(reading_from_channel);
+    let fd = pipe
+        .fd
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|error| tag!("Failed to duplicate URI-list pipe for remapper: {}", error))?;
+    pipe.fd = spawn_uri_list_remap(fd, program, kind, direction, reading_from_channel)?;
+    Ok(())
 }
 
 /** Update mapping and mirror of a shared memory file descriptor for an increased
@@ -5932,6 +6095,8 @@ pub struct Options {
     pub test_no_timeline_export: bool,
     /** If true, assume the platform does not support binary semaphore importing */
     pub test_no_binary_semaphore_import: bool,
+    /** Program to run on text/uri-list data transfers */
+    pub uri_list_remapper: Option<PathBuf>,
 }
 
 /** The main entrypoint for Wayland protocol proxying; should be given already opened and connected sockets
@@ -6133,4 +6298,69 @@ pub fn main_interface_loop(
 
     debug!("Done.");
     ret
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn log_remapper() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/uri-list-remap-log.sh")
+    }
+
+    #[test]
+    fn uri_list_remap_direction_tracks_stream_direction() {
+        assert_eq!(uri_list_remap_direction(true), "remote-to-local");
+        assert_eq!(uri_list_remap_direction(false), "local-to-remote");
+    }
+
+    #[test]
+    fn uri_list_remap_preserves_channel_to_wayland_stream() {
+        let (read_end, write_end) = unistd::pipe2(fcntl::OFlag::O_CLOEXEC).unwrap();
+        let remapper_stdin = spawn_uri_list_remap(
+            write_end,
+            &log_remapper(),
+            "wl-data",
+            "remote-to-local",
+            true,
+        )
+        .unwrap();
+
+        let mut writer = File::from(remapper_stdin);
+        writer
+            .write_all(b"file:///tmp/one\nfile:///tmp/two\n")
+            .unwrap();
+        drop(writer);
+
+        let mut reader = File::from(read_end);
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, b"file:///tmp/one\nfile:///tmp/two\n");
+    }
+
+    #[test]
+    fn uri_list_remap_preserves_wayland_to_channel_stream() {
+        let (read_end, write_end) = unistd::pipe2(fcntl::OFlag::O_CLOEXEC).unwrap();
+        let remapper_stdout = spawn_uri_list_remap(
+            read_end,
+            &log_remapper(),
+            "cutbuffer",
+            "local-to-remote",
+            false,
+        )
+        .unwrap();
+
+        let mut writer = File::from(write_end);
+        writer
+            .write_all(b"file:///tmp/one\nfile:///tmp/two\n")
+            .unwrap();
+        drop(writer);
+
+        set_blocking(&remapper_stdout).unwrap();
+        let mut reader = File::from(remapper_stdout);
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, b"file:///tmp/one\nfile:///tmp/two\n");
+    }
 }

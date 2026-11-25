@@ -861,6 +861,7 @@ fuzz_target!(|data: &[u8]| {
         test_skip_vulkan: skip_vulkan,
         test_no_timeline_export: no_timeline,
         test_no_binary_semaphore_import: false,
+        uri_list_remapper: None,
     };
 
     let sigaction = signal::SigAction::new(

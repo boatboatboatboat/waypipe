@@ -13,7 +13,7 @@ waypipe - A transparent proxy for Wayland applications
 *waypipe* *bench*++
 *waypipe* [*--version*] [*-h*, *--help*]
 
-\[options...\] = [*-c*, *--compress* C] [*-d*, *--debug*] [*-n*, *--no-gpu*] [*-o*, *--oneshot*] [*-s*, *--socket* S] [*--display* D] [*--drm-node* R] [*--remote-node* R] [*--ssh-bin R*] [*--remote-bin* R] [*--remote-socket* S] [*--login-shell*] [*--threads* T] [*--title-prefix* P] [*--unlink-socket*] [*--video* V] [*--vsock*] [*--secctx S*] [*--xwls*]
+\[options...\] = [*-c*, *--compress* C] [*-d*, *--debug*] [*-n*, *--no-gpu*] [*-o*, *--oneshot*] [*-s*, *--socket* S] [*--display* D] [*--drm-node* R] [*--remote-node* R] [*--ssh-bin R*] [*--remote-bin R*] [*--remote-socket* S] [*--login-shell*] [*--threads* T] [*--title-prefix* P] [*--unlink-socket*] [*--video* V] [*--uri-list-remapper* PROGRAM] [*--vsock*] [*--secctx S*] [*--xwls*]
 
 
 
@@ -90,6 +90,26 @@ compressible as images containing pictures.
 	its Wayland display socket to have a matching path. (If *D* is not an
 	absolute path, the socket will be created in the folder given by the
 	environment variable _XDG_RUNTIME_DIR_.)
+
+*--uri-list-remapper PROGRAM*
+	Run the executable _PROGRAM_ for each *text/uri-list* transfer. Waypipe
+	passes the transfer type and direction as the first and second positional
+	arguments, and streams the transfer through the program's standard input and
+	output. The program's standard error is inherited.
+
+	The transfer type is *cutbuffer* for primary-selection protocols, *clipboard*
+	for data-control protocols, and *wl-data* for the standard data-device
+	protocol (which covers both clipboard and drag-and-drop). The direction is
+	*local-to-remote* or *remote-to-local*, relative to the Waypipe instance
+	running the remapper.
+	In *ssh* mode the remapper runs on the local side. When using separate client
+	and server commands, configure it on only one side to avoid running
+	it twice.
+
+	For example, *--uri-list-remapper /path/to/uri-list-remap-log.sh* uses the
+	pass-through program shipped in the Waypipe source tree. It logs the payload
+	to standard error, so file paths and URIs in the transfer will be visible
+	in the logs.
 
 *--drm-node R*
 	Specify the path *R* to the drm device that this instance of waypipe should

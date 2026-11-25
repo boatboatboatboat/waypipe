@@ -348,6 +348,10 @@ fn build_connection_command<'a>(
     if options.test_no_binary_semaphore_import {
         args.push(OsStr::new("--test-no-binary-semaphore-import"));
     }
+    if let Some(uri_list_remapper) = &options.uri_list_remapper {
+        args.push(OsStr::new("--uri-list-remapper"));
+        args.push(uri_list_remapper.as_os_str());
+    }
     if client {
         args.push(OsStr::new("client-conn"));
     } else {
@@ -1972,6 +1976,33 @@ fn test_ssh_parsing() {
     }
 }
 
+#[test]
+fn test_uri_list_remapper_is_forwarded_to_connection_process() {
+    let uri_list_remapper = PathBuf::from("examples/uri-list-remap-log.sh");
+    let options = Options {
+        debug: false,
+        no_gpu: false,
+        compression: Compression::None,
+        video: VideoSetting::default(),
+        threads: 1,
+        title_prefix: String::new(),
+        drm_node: None,
+        test_skip_vulkan: false,
+        test_no_timeline_export: false,
+        test_no_binary_semaphore_import: false,
+        uri_list_remapper: Some(uri_list_remapper.clone()),
+    };
+    let mut strings = Vec::new();
+    let socket_path = SocketSpec::Unix(PathBuf::from("/tmp/waypipe.sock"));
+    let args = build_connection_command(&mut strings, &socket_path, &options, true, false);
+
+    let remapper_arg_idx = args
+        .iter()
+        .position(|arg| *arg == OsStr::new("--uri-list-remapper"))
+        .unwrap();
+    assert_eq!(args[remapper_arg_idx + 1], uri_list_remapper.as_os_str());
+}
+
 // an available/unavailable list could be constructed if #[cfg] where to apply to expressions
 const VERSION_STRING_CARGO: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -2165,6 +2196,15 @@ fn main() -> Result<ExitCode, String> {
                 .value_parser(value_parser!(VideoSetting)),
         )
         .arg(
+            Arg::new("uri-list-remapper")
+                .long("uri-list-remapper")
+                .value_name("program")
+                .help(
+                    "Run program to remap URIs in text/uri-list transfers; it receives the transfer type and direction as arguments",
+                )
+                .value_parser(value_parser!(PathBuf)),
+        )
+        .arg(
             Arg::new("vsock")
                 .long("vsock")
                 .help("Connect over vsock-type socket instead of unix socket")
@@ -2305,6 +2345,7 @@ fn main() -> Result<ExitCode, String> {
     let remote_node = matches.get_one::<PathBuf>("remote-node");
     let drm_node = matches.get_one::<PathBuf>("drm-node");
     let loop_test = matches.get_one::<bool>("test-loop").unwrap();
+    let uri_list_remapper = matches.get_one::<PathBuf>("uri-list-remapper").cloned();
     let fast_bench = *matches.get_one::<bool>("test-fast-bench").unwrap();
     let use_xwls = *matches.get_one::<bool>("xwls").unwrap();
     let test_wire_version: Option<u32> = matches.get_one::<u32>("test-wire-version").copied();
@@ -2393,6 +2434,7 @@ fn main() -> Result<ExitCode, String> {
         test_skip_vulkan,
         test_no_timeline_export,
         test_no_binary_semaphore_import,
+        uri_list_remapper,
     };
 
     /* Needed to revert back to original cwdir after

@@ -1511,6 +1511,73 @@ fn space_le(x: (usize, usize), y: (usize, usize)) -> bool {
     x.0 <= y.0 && x.1 <= y.1
 }
 
+fn parse_data_transfer_info<'a>(
+    interface: WaylandInterface,
+    method: MethodId,
+    msg: &'a [u8],
+) -> Result<(&'a [u8], &'static str), String> {
+    let (mime_type, kind) = match (interface, method) {
+        (
+            WaylandInterface::ZwpPrimarySelectionSourceV1,
+            OPCODE_ZWP_PRIMARY_SELECTION_SOURCE_V1_SEND,
+        ) => (
+            parse_evt_zwp_primary_selection_source_v1_send(msg),
+            "cutbuffer",
+        ),
+        (
+            WaylandInterface::ZwpPrimarySelectionOfferV1,
+            OPCODE_ZWP_PRIMARY_SELECTION_OFFER_V1_RECEIVE,
+        ) => (
+            parse_req_zwp_primary_selection_offer_v1_receive(msg),
+            "cutbuffer",
+        ),
+        (WaylandInterface::GtkPrimarySelectionSource, OPCODE_GTK_PRIMARY_SELECTION_SOURCE_SEND) => {
+            (
+                parse_evt_gtk_primary_selection_source_send(msg),
+                "cutbuffer",
+            )
+        }
+        (
+            WaylandInterface::GtkPrimarySelectionOffer,
+            OPCODE_GTK_PRIMARY_SELECTION_OFFER_RECEIVE,
+        ) => (
+            parse_req_gtk_primary_selection_offer_receive(msg),
+            "cutbuffer",
+        ),
+        (WaylandInterface::ExtDataControlSourceV1, OPCODE_EXT_DATA_CONTROL_SOURCE_V1_SEND) => {
+            (parse_evt_ext_data_control_source_v1_send(msg), "clipboard")
+        }
+        (WaylandInterface::ExtDataControlOfferV1, OPCODE_EXT_DATA_CONTROL_OFFER_V1_RECEIVE) => (
+            parse_req_ext_data_control_offer_v1_receive(msg),
+            "clipboard",
+        ),
+        (WaylandInterface::ZwlrDataControlSourceV1, OPCODE_ZWLR_DATA_CONTROL_SOURCE_V1_SEND) => {
+            (parse_evt_zwlr_data_control_source_v1_send(msg), "clipboard")
+        }
+        (WaylandInterface::ZwlrDataControlOfferV1, OPCODE_ZWLR_DATA_CONTROL_OFFER_V1_RECEIVE) => (
+            parse_req_zwlr_data_control_offer_v1_receive(msg),
+            "clipboard",
+        ),
+        (WaylandInterface::WlDataSource, OPCODE_WL_DATA_SOURCE_SEND) => {
+            (parse_evt_wl_data_source_send(msg), "wl-data")
+        }
+        (WaylandInterface::WlDataOffer, OPCODE_WL_DATA_OFFER_RECEIVE) => {
+            (parse_req_wl_data_offer_receive(msg), "wl-data")
+        }
+        _ => return Err(tag!("Unexpected data-transfer message")),
+    };
+
+    mime_type
+        .map(|mime_type| (mime_type, kind))
+        .map_err(|error| {
+            tag!(
+                "Failed to parse data-transfer MIME type for {}: {}",
+                INTERFACE_TABLE[interface as usize].name,
+                error
+            )
+        })
+}
+
 /** Macro to check if the required space (`x` bytes, `y` fds) is more than
  * the available space (`r.0` and `r.1`) and if so, return the required space. */
 macro_rules! check_space {
@@ -3385,12 +3452,23 @@ pub fn process_way_msg(
         | (WaylandInterface::WlDataOffer, OPCODE_WL_DATA_OFFER_RECEIVE) => {
             check_space!(msg.len(), 1, remaining_space);
 
-            /* Message format is mimetype + fd, and the mimetype doesn't matter
-             * for Waypipe */
+            let remapper = if let Some(program) = glob.opts.uri_list_remapper.as_deref() {
+                let (mime_type, kind) = parse_data_transfer_info(obj.obj_type, mod_opcode, msg)?;
+                if mime_type == b"text/uri-list" {
+                    Some((program, kind))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             match transl {
                 TranslationInfo::FromChannel((x, y)) => {
                     let sfd = x.pop_front().ok_or_else(|| tag!("Missing sfd"))?;
+                    if let Some((program, kind)) = remapper {
+                        attach_uri_list_remap(&sfd, program, kind)?;
+                    }
                     y.push_back(sfd);
                 }
                 TranslationInfo::FromWayland((x, y)) => {
@@ -3399,6 +3477,9 @@ pub fn process_way_msg(
                         glob,
                         true, // reading from channel
                     )?;
+                    if let Some((program, kind)) = remapper {
+                        attach_uri_list_remap(&v, program, kind)?;
+                    }
                     y.push(v);
                 }
             };
@@ -4549,4 +4630,41 @@ pub fn setup_object_map() -> BTreeMap<ObjId, WpObject> {
         },
     );
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_uri_list_mime_types_and_transfer_classes() {
+        let mime = b"text/uri-list";
+        let len = length_req_wl_data_offer_receive(mime.len());
+        let mut msg = vec![0; len];
+        let mut dst = &mut msg[..];
+        write_req_wl_data_offer_receive(&mut dst, ObjId(2), false, mime);
+        assert_eq!(
+            parse_data_transfer_info(
+                WaylandInterface::WlDataOffer,
+                OPCODE_WL_DATA_OFFER_RECEIVE,
+                &msg
+            )
+            .unwrap(),
+            (mime.as_slice(), "wl-data")
+        );
+
+        let len = length_evt_zwp_primary_selection_source_v1_send(mime.len());
+        let mut msg = vec![0; len];
+        let mut dst = &mut msg[..];
+        write_evt_zwp_primary_selection_source_v1_send(&mut dst, ObjId(3), false, mime);
+        assert_eq!(
+            parse_data_transfer_info(
+                WaylandInterface::ZwpPrimarySelectionSourceV1,
+                OPCODE_ZWP_PRIMARY_SELECTION_SOURCE_V1_SEND,
+                &msg
+            )
+            .unwrap(),
+            (mime.as_slice(), "cutbuffer")
+        );
+    }
 }

@@ -616,6 +616,7 @@ fuzz_target!(|data: &[u8]| {
         test_skip_vulkan: false,
         test_no_timeline_export: false,
         test_no_binary_semaphore_import: false,
+        uri_list_remapper: None,
     };
 
     if std::env::var_os("FUZZ_DEBUG").is_some() {
